@@ -26,6 +26,10 @@ precisely — and where most monitors silently show you stale data. suzu doesn't
 - **One file, zero dependencies** — `urllib`, `json`, `re`, `subprocess`, `termios`.
   No curses, no rich, no textual: raw ANSI into the alternate screen buffer,
   redraws on `SIGWINCH`, single-key controls.
+- **Resizes like btop** — drag the terminal anywhere and the layout re-decides
+  every frame: big digits collapse to a stat line, the engine box sheds its
+  luxuries, history compacts, the heatmap folds away. Boxes shrink instead of
+  getting cut mid-border.
 - **Honest about engines** — every engine exposes a different slice of the truth.
   suzu shows what's live, reconstructs what's closed, and *tells you which is which*.
 - **Multi-engine by design** — llama.cpp, vLLM, TabbyAPI/ExLlamaV3, TensorFold,

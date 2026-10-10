@@ -2732,17 +2732,21 @@ class View:
                 self.pk_pf = max(live["pf"], self.pk_pf - 0.02 * self.pk_pf)
         return cur, live
 
-    def totals_rows(self, cur):
-        """Every token the engine has handled since it started: prompt in (and how much of it came from cache),
-        generated out, requests. Short units: the box is ~44 columns."""
-        t = self.t
+    @staticmethod
+    def sh_num(n):
+        """Short units for the totals boxes: 3.4M, 1.1G, 980k."""
+        n = float(n or 0)
+        for div, suf in ((1e9, "G"), (1e6, "M"), (1e3, "k")):
+            if n >= div:
+                return "%.1f%s" % (n / div, suf)
+        return "%d" % n
 
-        def sh(n):
-            n = float(n or 0)
-            for div, suf in ((1e9, "G"), (1e6, "M"), (1e3, "k")):
-                if n >= div:
-                    return "%.1f%s" % (n / div, suf)
-            return "%d" % n
+    def totals_rows(self, cur, hermes=True):
+        """Every token the engine has handled since it started: prompt in (and how much of it came from cache),
+        generated out, requests. Short units: the box is ~44 columns. hermes=False drops the harness rows
+        (the btop-style engine-box shrink uses that to reclaim rows on a short terminal)."""
+        t = self.t
+        sh = self.sh_num
         reqs = (" . %d req" % cur.nreq) if cur.nreq is not None else ""
         out = "%s%-13s%s %s%s%s%s%s%s" % (t.label, "tokens out", t.rst(), t.value, sh(cur.gen), t.rst(),
                                           t.frame, reqs, t.rst())
@@ -2756,7 +2760,8 @@ class View:
             rows.append("%s%-13s%s %s%s in . %s out%s%s . %d req%s"
                         % (t.label, "since " + since, t.rst(), t.value, sh(cur.all_in), sh(cur.all_out), t.rst(),
                            t.frame, cur.all_n, t.rst()))
-        rows += self.hermes_rows(sh)
+        if hermes:
+            rows += self.hermes_rows(sh)
         return rows
 
     MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
@@ -3500,7 +3505,17 @@ class View:
         A(dline)
         A("")
 
-        # ---- big decode readout (llm-visuals: tall numerals on the FLOW ramp)
+        # ---- big decode readout (llm-visuals: tall numerals on the FLOW ramp).
+        # btop-style: full digits with room, stat line only on a short terminal.
+        dstat = (self.pulse_head(int(time.time() * 2)) + " DECODE"
+                 if cur.busy and gen > 0 else "  DECODE")
+        dstat_line = clip("%s%s%s %s%*.1f t/s%s  %s  %speak %*.1f%s  %s%s tok total%s"
+                          % (t.label, dstat, t.rst(),
+                             t.value + t.bold(), 6, gen, t.rst(),
+                             self.gauge(min(1.0, gen / max(self.pk_gen, 0.5))
+                                        if self.pk_gen else 0.0, 14),
+                             t.frame, 6, self.pk_gen, t.rst(),
+                             t.label, human(cur.gen), t.rst()), width)
         if not height or height >= 26:
             if t.plain:
                 gcol = t.value if gen else t.frame
@@ -3510,15 +3525,10 @@ class View:
             for r in self.big_digits(gen, max(18, width // 2 - 4),
                                      gcol if not t.plain else ""):
                 A(clip(r, width))
-            stat = (self.pulse_head(int(time.time() * 2)) + " DECODE"
-                    if cur.busy and gen > 0 else "  DECODE")
-            bar = self.gauge(min(1.0, gen / max(self.pk_gen, 0.5))
-                             if self.pk_gen else 0.0, 14)
-            A(clip("%s%s%s %s%*.1f t/s%s  %s  %speak %*.1f%s  %s%s tok total%s"
-                   % (t.label, stat, t.rst(),
-                      t.value + t.bold(), 6, gen, t.rst(),
-                      bar, t.frame, 6, self.pk_gen, t.rst(),
-                      t.label, human(cur.gen), t.rst()), width))
+            A(dstat_line)
+            A("")
+        elif height >= 20:
+            A(dstat_line)
             A("")
 
         # ---- acceptance
@@ -3565,8 +3575,12 @@ class View:
             A(clip(line, width))
         A("")
 
-        # ---- engine/session, history, rolling averages
-        eng_body = [
+        # ---- engine/session, history, rolling averages. btop-style row budget:
+        # the engine box SHRINKS level by level (all-models block, then the
+        # per-request counters) instead of being clipped mid-border, history
+        # compacts to two rows, and a short terminal stacks instead of splitting
+        # columns. height=0/None keeps the old show-everything layout.
+        eng_core = [
             "%s%-13s%s %s" % (t.label, "kv cache", t.rst(), self.pct(sl["kv"], 10)),
             "%s%-13s%s %s%s" % (t.label, "prefix cache", t.rst(),
                                 self.pct(sl["prefix"], 10, good_high=True),
@@ -3587,9 +3601,12 @@ class View:
             *((lambda w: list(w) if isinstance(w, tuple) else [w])(self.waiting_row(cur))),
             "%s%-13s%s %s%s%s" % (t.label, "slot ctx", t.rst(), t.value,
                                   sl["ctxtxt"], t.rst()),
-            "%s%-13s%s %s%s%s" % (t.label, "ctx max seen", t.rst(), t.label,
-                                  human(cur.ctxmax), t.rst()),
-            *self.totals_rows(cur),
+        ]
+        eng_ctx = ["%s%-13s%s %s%s%s" % (t.label, "ctx max seen", t.rst(), t.label,
+                                         human(cur.ctxmax), t.rst())]
+        eng_tot = self.totals_rows(cur, hermes=False)
+        eng_herm = self.hermes_rows(self.sh_num)
+        eng_spec = [
             "",
             "%s%-13s%s %s%s%s" % (t.label, "accepted", t.rst(), t.value,
                                   human(cur.acc), t.rst()),
@@ -3602,11 +3619,20 @@ class View:
                                                      t.heat(s_alpha), s_alpha * 100,
                                                      t.rst(), t.frame, s_tau, t.rst())),
         ]
-        wide = width >= self.WIDE
+        eng_l0 = eng_core + eng_ctx + eng_tot + eng_herm + eng_spec
+        eng_l1 = eng_core + eng_ctx + eng_tot + eng_spec
+        eng_l2 = eng_core + eng_tot
+        eng_l3 = [eng_core[0], eng_core[1], eng_core[3]] + eng_tot[-1:]
+        wide = width >= self.WIDE and (not height or height >= 40)
         lw = max(34, int(width * 0.36)) if wide else width
         rw = (width - lw - 2) if wide else width
         sw = max(4, rw - 36)
-        hist_body = [
+        heat_body = self.heatmap_rows(rw) if rw >= 44 else None
+        heat_cost = (len(heat_body) + 2) if heat_body else 0
+        dig_rows = 8 if (not height or height >= 26) else (2 if height >= 20 else 0)
+        base_rows = ((3 + (1 if strip else 0)) + 3
+                     + (4 if width >= self.NARROW else 10) + dig_rows)
+        hist_all = [
             self.hrow("gen t/s", self.h_gen, sw, "%.1f", t.heat(0.9),
                       "%d tick" % len(self.h_gen), fit=rw - 2),
             self.hrow("prompt t/s", self.h_pf, sw, "%.0f", t.heat(0.7), "", fit=rw - 2),
@@ -3614,6 +3640,31 @@ class View:
                       "n/a on tensorfold" if cur.tf_nodraft else "%d req" % len(self.h_acc), fit=rw - 2),
             self.hrow("tau", self.h_tau, sw, "%.2f", t.head, "", fit=rw - 2),
         ]
+        # ---- layout search: engine level x history compact x rolling x heatmap.
+        # Value = engine detail first, then the tokens heatmap, then rolling;
+        # a layout is legal when everything above + the block leaves >= 3 rows
+        # (per-position and the panels below gate themselves on real space).
+        best = None
+        for ei, body in enumerate((eng_l0, eng_l1, eng_l2, eng_l3)):
+            ecost = len(body) + 2
+            for compact in (False, True):
+                hbody = hist_all[:2] if compact else hist_all
+                hcost = len(hbody) + 2
+                for roll in (True, False):
+                    for heat in ((True, False) if heat_body else (False,)):
+                        right = hcost + (4 if roll else 0) + (heat_cost if heat else 0)
+                        block = max(ecost, right) if wide else ecost + right
+                        if not height or height - base_rows - block >= 3:
+                            val = ((3 - ei) * 100 + (50 if heat else 0)
+                                   + (10 if roll else 0) - (5 if compact else 0))
+                            if best is None or val > best[0]:
+                                best = (val, body, hbody, roll, heat)
+        if best:
+            _, eng_body, hist_body, roll_ok, heat_ok = best
+            eng_cost = len(eng_body) + 2
+        else:  # terminal far too small even for the minimum: show the core anyway
+            eng_body, eng_cost = eng_l3, len(eng_l3) + 2
+            hist_body, roll_ok, heat_ok = hist_all[:2], False, False
         avg_body = [
             "%s%-15s%s %s%.1f%s   %s%-11s%s %s%s%s"
             % (t.label, "avg gen t/s", t.rst(), t.value, self.wmean(self.q_gen),
@@ -3625,10 +3676,10 @@ class View:
                self.wmean(self.q_tau), t.rst()),
         ]
         left = self.box("engine & session", eng_body, lw)
-        right_col = (self.box("history", hist_body, rw)
-                     + self.box("rolling averages", avg_body, rw))
-        heat_body = self.heatmap_rows(rw)
-        if heat_body:
+        right_col = self.box("history", hist_body, rw)
+        if roll_ok:
+            right_col += self.box("rolling averages", avg_body, rw)
+        if heat_ok and heat_body:
             right_col += self.box("generated tokens per day . all models", heat_body, rw)
         if wide:
             for i in range(max(len(left), len(right_col))):
@@ -3641,7 +3692,8 @@ class View:
         A("")
 
         # ---- per-position: wraps onto as many rows as the width needs
-        if posn:
+        # (btp-style budget: dropped entirely when too few rows remain)
+        if posn and (not height or height - len(L) >= 4):
             barw = 8 if width >= 100 else 5 if width >= 60 else 3
             cellw = barw + 10
             per = max(1, (width - 4) // cellw)
