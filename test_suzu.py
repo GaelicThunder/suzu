@@ -163,9 +163,8 @@ print("\n--- 6) layout at every width: nothing crosses the border")
 for w in (40, 60, 80, 100, 118, 130, 170, 200):
     lines = v.frame(w, 60)
     over = [l for l in lines if m.vis_len(l) > w]
-    stacked = w < m.View.WIDE
-    print("  width=%-4d rows=%-3d overflow=%d  %s"
-          % (w, len(lines), len(over), "stacked" if stacked else "side-by-side"))
+    print("  width=%-4d rows=%-3d overflow=%d"
+          % (w, len(lines), len(over)))
     if over:
         fails.append("overflow@%d" % w)
 
