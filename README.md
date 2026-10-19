@@ -135,11 +135,13 @@ cannot see, because a gateway answers before its scheduler ever touches the engi
 default `yuzu` theme is the warm one above; `neon` is the classic forum-panel look;
 `phosphor` is the green/amber EVA-style CRT, with its own phosphor ramps.
 
-| yuzu | neon | matrix | amber | ice |
-|---|---|---|---|---|
-| ![](assets/themes/theme-yuzu.png) | ![](assets/themes/theme-neon.png) | ![](assets/themes/theme-matrix.png) | ![](assets/themes/theme-amber.png) | ![](assets/themes/theme-ice.png) |
-| **grape** | **sunset** | **oxide** | **vapor** | **paper** |
-| ![](assets/themes/theme-grape.png) | ![](assets/themes/theme-sunset.png) | ![](assets/themes/theme-oxide.png) | ![](assets/themes/theme-vapor.png) | ![](assets/themes/theme-paper.png) |
+| yuzu | neon | matrix | amber |
+|---|---|---|---|
+| ![](assets/themes/theme-yuzu.png) | ![](assets/themes/theme-neon.png) | ![](assets/themes/theme-matrix.png) | ![](assets/themes/theme-amber.png) |
+| **phosphor** | **ice** | **grape** | **sunset** |
+| ![](assets/themes/theme-phosphor.png) | ![](assets/themes/theme-ice.png) | ![](assets/themes/theme-grape.png) | ![](assets/themes/theme-sunset.png) |
+| **oxide** | **vapor** | **paper** | |
+| ![](assets/themes/theme-oxide.png) | ![](assets/themes/theme-vapor.png) | ![](assets/themes/theme-paper.png) | |
 
 Color depth auto-detects (truecolor / 256); `--color truecolor|256|auto` forces it.
 Themes persist to `~/.config/suzu/theme` (`SUZU_THEME` overrides the path).
