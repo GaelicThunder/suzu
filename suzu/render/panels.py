@@ -16,7 +16,7 @@ from ..fetch.http import g, gl, http_get, parse_metrics
 from ..fetch.info import load_model_arch, model_config_path
 from ..fetch.rank1 import roce_link
 from ..fetch.tensorfold import _TF_HEALTH, hermes_days, hermes_usage
-from ..text import clip, human, pad, si_bytes
+from ..text import clip, human, pad, si_bytes, vis_len
 from ..themes import DITHER
 
 
@@ -67,7 +67,7 @@ class PanelsMixin:
 
         tel = r1.get("telemetry")
         if tel == "no url":
-            tel_s = "%srank 1: --rank1-url not set%s" % (t.dim(), t.rst())
+            tel_s = ("%srank 1: no url%s" if narrow else "%srank 1: --rank1-url not set%s") % (t.dim(), t.rst())
         elif tel == "live":
             tel_s = "%s%.1f s ago%s" % (t.frame, r1.get("age") or 0.0, t.rst())
         elif tel == "stale":
@@ -85,34 +85,61 @@ class PanelsMixin:
             state = "%s%s%s" % (t.heat(0.9), (st[:1].lower() + st[1:]) if st else "up", t.rst())
         else:
             state = ""
+        def fit_row(base, *pieces):
+            """Append optional columns while the row still fits the box.
+            A column that does not fit is dropped whole - never cut mid-word:
+            at 78 columns 'rank 1: --rank1-url not set' used to lose its tail
+            and read as if the feed had simply gone quiet."""
+            row = base
+            for p in pieces:
+                if not p:
+                    continue
+                cand = row + "   " + p
+                if vis_len(cand) <= inner:
+                    row = cand
+            return row
+
         body = []
         g0 = (self.gpu or [None])[0]
         mem = self.memory or {}
         tot, avail = (mem.get("total") or 0) / 1024.0, (mem.get("avail") or 0) / 1024.0
         rss = ("%sengine rss %.1fG%s" % (t.frame, (mem.get("rss") or 0) / 1048576.0, t.rst())) if mem.get("rss") else ""
-        body.append(name("rank 0", "this box") + gpu_cols(g0) + ram_cols(tot - avail, tot, avail) + "   " + rss)
-        body.append(name("rank 1", "remote") + gpu_cols(r1.get("gpu"))
-                    + ram_cols(r1.get("ramUsedMb"), r1.get("ramTotalMb"), r1.get("availMb"))
-                    + "   " + "   ".join(x for x in (state, tel_s) if x))
+        r0 = name("rank 0", "this box") + gpu_cols(g0)
+        ram0 = ram_cols(tot - avail, tot, avail)
+        if vis_len(r0 + ram0) <= inner:
+            r0 += ram0
+        body.append(fit_row(r0, rss))
+        r1row = name("rank 1", "remote") + gpu_cols(r1.get("gpu"))
+        ram1 = ram_cols(r1.get("ramUsedMb"), r1.get("ramTotalMb"), r1.get("availMb"))
+        if vis_len(r1row + ram1) <= inner:
+            r1row += ram1
+        body.append(fit_row(r1row, state, tel_s))
         if cluster:
             tx, rx, pk, devs = roce_link()
             if tx is None:
                 link = name("link", "CX7 ") + "%sNET%s %smeasuring...%s" % (t.label, t.rst(), t.dim(), t.rst())
             else:
                 frac = (max(tx, rx) / pk) if pk else 0.0
-                link = (name("link", "CX7 ") + "%sNET%s %s %sout %9s/s  in %9s/s%s"
-                        % (t.label, t.rst(), self.gauge(frac, gw), t.value, si_bytes(tx), si_bytes(rx), t.rst()))
+                link = (name("link", "CX7 ") + "%sNET%s %s" % (t.label, t.rst(), self.gauge(frac, gw))
+                        + "%s %sout %9s/s%s" % (t.rst(), t.value, si_bytes(tx), t.rst()))
+                tail = "  in %9s/s%s" % (si_bytes(rx), t.rst())
+                if vis_len(link + tail) <= inner:
+                    link += tail
                 if not narrow:
-                    link += "   %speak %s/s . %s%s" % (t.frame, si_bytes(pk), "+".join(devs) or "no RoCE device", t.rst())
+                    tail = "   %speak %s/s . %s%s" % (t.frame, si_bytes(pk), "+".join(devs) or "no RoCE device", t.rst())
+                    if vis_len(link + tail) <= inner:
+                        link += tail
             hl = _TF_HEALTH if getattr(self, "tf", False) else {"at": None}
             if hl.get("at") is not None and time.monotonic() - hl["at"] < 10:
                 it = hl.get("iteration_s") or 0.0
                 if hl.get("ok") is False or hl.get("fatal"):
-                    link += "   %sENGINE FATAL - restart both ranks%s" % (t.heat(0.05), t.rst())
+                    extra = "   %sENGINE FATAL - restart both ranks%s" % (t.heat(0.05), t.rst())
                 elif it >= 30:
-                    link += "   %sSTALLED: iteration running %.0f s (ranks out of step?)%s" % (t.heat(0.1), it, t.rst())
+                    extra = "   %sSTALLED: iteration running %.0f s (ranks out of step?)%s" % (t.heat(0.1), it, t.rst())
                 else:
-                    link += "   %sin step%s %s(iteration %.1f s)%s" % (t.heat(0.9), t.rst(), t.frame, it, t.rst())
+                    extra = "   %sin step%s %s(iteration %.1f s)%s" % (t.heat(0.9), t.rst(), t.frame, it, t.rst())
+                if vis_len(link + extra) <= inner:
+                    link += extra
             body.append(link)
             if r1.get("run") is not None or r1.get("kv") is not None:      # the vLLM cluster's rank-1 /metrics
                 bits = []
@@ -184,9 +211,17 @@ class PanelsMixin:
         if i.get("spec"):
             bits.append("%s k=%s" % (i["spec"], i.get("k") or "?"))
         t = self.t
-        line = "  %s>%s %s%s%s" % (t.head, t.rst(), t.value,
-                                   " . ".join(bits), t.rst())
-        return [clip(line, width - 2)] if bits else None
+        head = "  %s>%s " % (t.head, t.rst())
+        line = head
+        for n, b in enumerate(bits):
+            cand = line + ("" if n == 0 else " . ") + b
+            if vis_len(cand + t.rst()) <= width - 2:
+                line = cand
+            elif n == 0:                       # the model name itself: clip it
+                line = cand
+            else:
+                break
+        return [clip(line + t.rst(), width - 2)] if bits else None
 
 
 

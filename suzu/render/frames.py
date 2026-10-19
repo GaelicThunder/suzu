@@ -475,11 +475,17 @@ class FramesMixin:
                 if cur.busy and gen > 0 else "  DECODE")
         bar = self.gauge(min(1.0, gen / max(self.pk_gen, 0.5))
                          if self.pk_gen else 0.0, 14)
-        dstat_line = clip("%s%s%s %s%*.1f t/s%s  %s  %speak %*.1f%s  %s%s tok total%s"
-                          % (t.label, stat, t.rst(),
-                             t.value + t.bold(), 6, gen, t.rst(),
-                             bar, t.frame, 6, self.pk_gen, t.rst(),
-                             t.label, human(cur.gen), t.rst()), width)
+        if width >= 66:
+            dstat_line = clip("%s%s%s %s%*.1f t/s%s  %s  %speak %*.1f%s  %s%s tok total%s"
+                              % (t.label, stat, t.rst(),
+                                 t.value + t.bold(), 6, gen, t.rst(),
+                                 bar, t.frame, 6, self.pk_gen, t.rst(),
+                                 t.label, human(cur.gen), t.rst()), width)
+        else:
+            # narrow: the rate and its gauge are the point, peak and total are not
+            dstat_line = clip("%s%s%s %s%*.1f t/s%s  %s"
+                              % (t.label, stat, t.rst(),
+                                 t.value + t.bold(), 6, gen, t.rst(), bar), width)
         if not height or height >= 26:
             if t.plain:
                 gcol = t.value if gen else t.frame
@@ -499,10 +505,20 @@ class FramesMixin:
         bw = max(10, min(46, width - 50))
         tfam = cur.tf_nodraft
         if tfam:
-            A(clip(self.tf_line(tau, bw, k) + "  %s(%s)%s" % (t.frame, src, t.rst()), width))
-            A(clip("%s* %.2f tokens a round%s %s- this TensorFold does not count drafted tokens: no acceptance %%, "
-                   "tau from the decode rounds%s" % (t.heat(self.tf_frac(tau, k)), tau + 1, t.rst(), t.dim(), t.rst()),
-                   width))
+            line = self.tf_line(tau, bw, k)
+            tail = "  %s(%s)%s" % (t.frame, src, t.rst())
+            A(line + tail if vis_len(line + tail) <= width else line)
+            # The explanation is a sentence, so it must not be cut mid-word at a
+            # narrow terminal: pick the longest form that fits instead.
+            forms = [
+                "* %.2f tokens a round - this TensorFold does not count drafted tokens: no acceptance %%, tau from the decode rounds",
+                "* %.2f tokens a round - TensorFold counts no drafted tokens: no acceptance %%, tau from decode rounds",
+                "* %.2f tokens a round - no acceptance %% on TensorFold",
+                "* %.2f tok/round - no acceptance %%",
+            ]
+            txt = next((f % (tau + 1) for f in forms if len(f % (tau + 1)) + 4 <= width),
+                       forms[-1] % (tau + 1))
+            A("%s%s%s" % (t.heat(self.tf_frac(tau, k)), txt, t.rst()))
         else:
             A(clip("%s◆ ACCEPTANCE%s %s  %s%.1f%%%s  %stau=%.2f/%d%s  %s(%s)%s"
                    % (t.title, t.rst(), self.bar(alpha, bw), t.heat(alpha), alpha * 100,
@@ -666,8 +682,11 @@ class FramesMixin:
         # to stack with rolling averages and per-position. In two-column mode the
         # heatmap joins the right column (it needs ~44 columns, not a whole row).
         heat_body = self.heatmap_rows(mw)
-        heat_title = ("generated tokens per day . all models" if mw >= 42
-                      else "generated tokens per day" if mw >= 28 else "tokens/day")
+        heat_title = ("generated tokens per day . all models"
+                      if vis_len(" generated tokens per day . all models ") <= mw - 4
+                      else "generated tokens per day"
+                      if vis_len(" generated tokens per day ") <= mw - 4
+                      else "tokens/day")
         heat_box = (self.box(heat_title, heat_body, mw)
                     if heat_body else [])
         mid_col = heat_box if ncols == 3 else []
@@ -687,7 +706,11 @@ class FramesMixin:
             body = []
             for i in range(0, len(chunks), per):
                 body.append("".join(pad(c, cellw) for c in chunks[i:i + per]))
-            return self.box("per-position acceptance  (%s)" % src, body, w, t.accent)
+            title = next((x for x in ("per-position acceptance  (%s)" % src,
+                                      "per-position  (%s)" % src,
+                                      "per-position")
+                          if vis_len(" " + x + " ") <= w - 4), "per-pos")
+            return self.box(title, body, w, t.accent)
         # Side column in visual order: history on top, rolling averages,
         # per-position, then the day chart (when the chart is not the middle
         # column). A btop-style row budget then drops the lowest-priority box
@@ -775,6 +798,10 @@ class FramesMixin:
                 else:
                     title = ("expert routing heat  (simulated - vllm does not "
                              "export router choices; colour = time since routed)")
+                # A box title is never cut mid-word: drop the parenthetical first.
+                if vis_len(" " + title + " ") > width - 4:
+                    short = title.split("  (")[0]
+                    title = short if vis_len(" " + short + " ") <= width - 4 else "expert heat"
                 for r in self.box(title, rows, width, t.accent):
                     A(clip(r, width))
 

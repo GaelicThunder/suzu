@@ -168,6 +168,31 @@ for w in (40, 60, 80, 100, 118, 130, 170, 200):
     if over:
         fails.append("overflow@%d" % w)
 
+print("\n--- 6b) no text is cut mid-word inside a box (the 'right sized' contract)")
+import suzu.text as _text
+import suzu.render.widgets as _widgets
+_cuts = []
+_real_clip = _text.clip
+
+
+def _count_clip(s, w):
+    if m.vis_len(s) > w:
+        _cuts.append((m.vis_len(s), w, m.SGR_RE.sub("", s)[:52]))
+    return _real_clip(s, w)
+
+
+_clip_mods = (m, _text, _widgets, suzu.render.frames, suzu.render.panels)
+for _mod in _clip_mods:
+    setattr(_mod, "clip", _count_clip)
+for w in (74, 84, 100, 118, 130, 160, 200):
+    for h in (24, 40, 62):
+        _cuts.clear()
+        v.frame(w, h)
+        v.frame(w, h)
+        ok("w=%-4d h=%-3d no mid-word cut (%d) %s" % (w, h, len(_cuts), _cuts[:2]), not _cuts)
+for _mod in _clip_mods:
+    setattr(_mod, "clip", _real_clip)
+
 print("\n--- 7) height clamp: never return more rows than the terminal has")
 for h in (10, 20, 30, 60):
     lines = v.frame(130, h)

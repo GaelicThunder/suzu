@@ -104,6 +104,11 @@ once instead of waiting out the interval).
    (engine rows, cluster probe, averages line), the layout uses three columns
    only when they fit, else two, else stacked, and slack is shared. No fixed
    38/32 fractions, no silent mid-word cuts.
+9. No text is cut mid-word. A panel that runs out of room drops whole optional
+   fields instead: the cluster row sheds its tail (state, then the rank-1
+   telemetry), the model strip stops adding fields, the tokens/round sentence
+   picks a shorter form, box titles drop their parenthetical. Test 6b counts
+   `clip()` truncations at 7 widths x 3 heights and requires zero.
 
 ## Add an engine
 
@@ -147,7 +152,7 @@ once instead of waiting out the interval).
 `test_suzu.py` drives the real `View` against a synthetic llama.cpp engine:
 
 1-5   live rate, spec window, request reset, restart, idle prefix cache
-6-7   layout at every width (no overflow) and height clamp
+6-7   layout at every width (no overflow) and height clamp; 6b counts mid-word cuts
 8-9   every theme renders coloured with a distinct ramp; cycling wraps
 10    TabbyAPI: `/metrics` 404, everything rebuilt from log + gateway
 11    TensorFold: counters, `/health` fill, rank-1 feed, RoCE, expert grid

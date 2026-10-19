@@ -2906,7 +2906,7 @@ class PanelsMixin:
 
         tel = r1.get("telemetry")
         if tel == "no url":
-            tel_s = "%srank 1: --rank1-url not set%s" % (t.dim(), t.rst())
+            tel_s = ("%srank 1: no url%s" if narrow else "%srank 1: --rank1-url not set%s") % (t.dim(), t.rst())
         elif tel == "live":
             tel_s = "%s%.1f s ago%s" % (t.frame, r1.get("age") or 0.0, t.rst())
         elif tel == "stale":
@@ -2924,34 +2924,61 @@ class PanelsMixin:
             state = "%s%s%s" % (t.heat(0.9), (st[:1].lower() + st[1:]) if st else "up", t.rst())
         else:
             state = ""
+        def fit_row(base, *pieces):
+            """Append optional columns while the row still fits the box.
+            A column that does not fit is dropped whole - never cut mid-word:
+            at 78 columns 'rank 1: --rank1-url not set' used to lose its tail
+            and read as if the feed had simply gone quiet."""
+            row = base
+            for p in pieces:
+                if not p:
+                    continue
+                cand = row + "   " + p
+                if vis_len(cand) <= inner:
+                    row = cand
+            return row
+
         body = []
         g0 = (self.gpu or [None])[0]
         mem = self.memory or {}
         tot, avail = (mem.get("total") or 0) / 1024.0, (mem.get("avail") or 0) / 1024.0
         rss = ("%sengine rss %.1fG%s" % (t.frame, (mem.get("rss") or 0) / 1048576.0, t.rst())) if mem.get("rss") else ""
-        body.append(name("rank 0", "this box") + gpu_cols(g0) + ram_cols(tot - avail, tot, avail) + "   " + rss)
-        body.append(name("rank 1", "remote") + gpu_cols(r1.get("gpu"))
-                    + ram_cols(r1.get("ramUsedMb"), r1.get("ramTotalMb"), r1.get("availMb"))
-                    + "   " + "   ".join(x for x in (state, tel_s) if x))
+        r0 = name("rank 0", "this box") + gpu_cols(g0)
+        ram0 = ram_cols(tot - avail, tot, avail)
+        if vis_len(r0 + ram0) <= inner:
+            r0 += ram0
+        body.append(fit_row(r0, rss))
+        r1row = name("rank 1", "remote") + gpu_cols(r1.get("gpu"))
+        ram1 = ram_cols(r1.get("ramUsedMb"), r1.get("ramTotalMb"), r1.get("availMb"))
+        if vis_len(r1row + ram1) <= inner:
+            r1row += ram1
+        body.append(fit_row(r1row, state, tel_s))
         if cluster:
             tx, rx, pk, devs = roce_link()
             if tx is None:
                 link = name("link", "CX7 ") + "%sNET%s %smeasuring...%s" % (t.label, t.rst(), t.dim(), t.rst())
             else:
                 frac = (max(tx, rx) / pk) if pk else 0.0
-                link = (name("link", "CX7 ") + "%sNET%s %s %sout %9s/s  in %9s/s%s"
-                        % (t.label, t.rst(), self.gauge(frac, gw), t.value, si_bytes(tx), si_bytes(rx), t.rst()))
+                link = (name("link", "CX7 ") + "%sNET%s %s" % (t.label, t.rst(), self.gauge(frac, gw))
+                        + "%s %sout %9s/s%s" % (t.rst(), t.value, si_bytes(tx), t.rst()))
+                tail = "  in %9s/s%s" % (si_bytes(rx), t.rst())
+                if vis_len(link + tail) <= inner:
+                    link += tail
                 if not narrow:
-                    link += "   %speak %s/s . %s%s" % (t.frame, si_bytes(pk), "+".join(devs) or "no RoCE device", t.rst())
+                    tail = "   %speak %s/s . %s%s" % (t.frame, si_bytes(pk), "+".join(devs) or "no RoCE device", t.rst())
+                    if vis_len(link + tail) <= inner:
+                        link += tail
             hl = _TF_HEALTH if getattr(self, "tf", False) else {"at": None}
             if hl.get("at") is not None and time.monotonic() - hl["at"] < 10:
                 it = hl.get("iteration_s") or 0.0
                 if hl.get("ok") is False or hl.get("fatal"):
-                    link += "   %sENGINE FATAL - restart both ranks%s" % (t.heat(0.05), t.rst())
+                    extra = "   %sENGINE FATAL - restart both ranks%s" % (t.heat(0.05), t.rst())
                 elif it >= 30:
-                    link += "   %sSTALLED: iteration running %.0f s (ranks out of step?)%s" % (t.heat(0.1), it, t.rst())
+                    extra = "   %sSTALLED: iteration running %.0f s (ranks out of step?)%s" % (t.heat(0.1), it, t.rst())
                 else:
-                    link += "   %sin step%s %s(iteration %.1f s)%s" % (t.heat(0.9), t.rst(), t.frame, it, t.rst())
+                    extra = "   %sin step%s %s(iteration %.1f s)%s" % (t.heat(0.9), t.rst(), t.frame, it, t.rst())
+                if vis_len(link + extra) <= inner:
+                    link += extra
             body.append(link)
             if r1.get("run") is not None or r1.get("kv") is not None:      # the vLLM cluster's rank-1 /metrics
                 bits = []
@@ -3023,9 +3050,17 @@ class PanelsMixin:
         if i.get("spec"):
             bits.append("%s k=%s" % (i["spec"], i.get("k") or "?"))
         t = self.t
-        line = "  %s>%s %s%s%s" % (t.head, t.rst(), t.value,
-                                   " . ".join(bits), t.rst())
-        return [clip(line, width - 2)] if bits else None
+        head = "  %s>%s " % (t.head, t.rst())
+        line = head
+        for n, b in enumerate(bits):
+            cand = line + ("" if n == 0 else " . ") + b
+            if vis_len(cand + t.rst()) <= width - 2:
+                line = cand
+            elif n == 0:                       # the model name itself: clip it
+                line = cand
+            else:
+                break
+        return [clip(line + t.rst(), width - 2)] if bits else None
 
 
 
@@ -3912,11 +3947,17 @@ class FramesMixin:
                 if cur.busy and gen > 0 else "  DECODE")
         bar = self.gauge(min(1.0, gen / max(self.pk_gen, 0.5))
                          if self.pk_gen else 0.0, 14)
-        dstat_line = clip("%s%s%s %s%*.1f t/s%s  %s  %speak %*.1f%s  %s%s tok total%s"
-                          % (t.label, stat, t.rst(),
-                             t.value + t.bold(), 6, gen, t.rst(),
-                             bar, t.frame, 6, self.pk_gen, t.rst(),
-                             t.label, human(cur.gen), t.rst()), width)
+        if width >= 66:
+            dstat_line = clip("%s%s%s %s%*.1f t/s%s  %s  %speak %*.1f%s  %s%s tok total%s"
+                              % (t.label, stat, t.rst(),
+                                 t.value + t.bold(), 6, gen, t.rst(),
+                                 bar, t.frame, 6, self.pk_gen, t.rst(),
+                                 t.label, human(cur.gen), t.rst()), width)
+        else:
+            # narrow: the rate and its gauge are the point, peak and total are not
+            dstat_line = clip("%s%s%s %s%*.1f t/s%s  %s"
+                              % (t.label, stat, t.rst(),
+                                 t.value + t.bold(), 6, gen, t.rst(), bar), width)
         if not height or height >= 26:
             if t.plain:
                 gcol = t.value if gen else t.frame
@@ -3936,10 +3977,20 @@ class FramesMixin:
         bw = max(10, min(46, width - 50))
         tfam = cur.tf_nodraft
         if tfam:
-            A(clip(self.tf_line(tau, bw, k) + "  %s(%s)%s" % (t.frame, src, t.rst()), width))
-            A(clip("%s* %.2f tokens a round%s %s- this TensorFold does not count drafted tokens: no acceptance %%, "
-                   "tau from the decode rounds%s" % (t.heat(self.tf_frac(tau, k)), tau + 1, t.rst(), t.dim(), t.rst()),
-                   width))
+            line = self.tf_line(tau, bw, k)
+            tail = "  %s(%s)%s" % (t.frame, src, t.rst())
+            A(line + tail if vis_len(line + tail) <= width else line)
+            # The explanation is a sentence, so it must not be cut mid-word at a
+            # narrow terminal: pick the longest form that fits instead.
+            forms = [
+                "* %.2f tokens a round - this TensorFold does not count drafted tokens: no acceptance %%, tau from the decode rounds",
+                "* %.2f tokens a round - TensorFold counts no drafted tokens: no acceptance %%, tau from decode rounds",
+                "* %.2f tokens a round - no acceptance %% on TensorFold",
+                "* %.2f tok/round - no acceptance %%",
+            ]
+            txt = next((f % (tau + 1) for f in forms if len(f % (tau + 1)) + 4 <= width),
+                       forms[-1] % (tau + 1))
+            A("%s%s%s" % (t.heat(self.tf_frac(tau, k)), txt, t.rst()))
         else:
             A(clip("%s◆ ACCEPTANCE%s %s  %s%.1f%%%s  %stau=%.2f/%d%s  %s(%s)%s"
                    % (t.title, t.rst(), self.bar(alpha, bw), t.heat(alpha), alpha * 100,
@@ -4103,8 +4154,11 @@ class FramesMixin:
         # to stack with rolling averages and per-position. In two-column mode the
         # heatmap joins the right column (it needs ~44 columns, not a whole row).
         heat_body = self.heatmap_rows(mw)
-        heat_title = ("generated tokens per day . all models" if mw >= 42
-                      else "generated tokens per day" if mw >= 28 else "tokens/day")
+        heat_title = ("generated tokens per day . all models"
+                      if vis_len(" generated tokens per day . all models ") <= mw - 4
+                      else "generated tokens per day"
+                      if vis_len(" generated tokens per day ") <= mw - 4
+                      else "tokens/day")
         heat_box = (self.box(heat_title, heat_body, mw)
                     if heat_body else [])
         mid_col = heat_box if ncols == 3 else []
@@ -4124,7 +4178,11 @@ class FramesMixin:
             body = []
             for i in range(0, len(chunks), per):
                 body.append("".join(pad(c, cellw) for c in chunks[i:i + per]))
-            return self.box("per-position acceptance  (%s)" % src, body, w, t.accent)
+            title = next((x for x in ("per-position acceptance  (%s)" % src,
+                                      "per-position  (%s)" % src,
+                                      "per-position")
+                          if vis_len(" " + x + " ") <= w - 4), "per-pos")
+            return self.box(title, body, w, t.accent)
         # Side column in visual order: history on top, rolling averages,
         # per-position, then the day chart (when the chart is not the middle
         # column). A btop-style row budget then drops the lowest-priority box
@@ -4212,6 +4270,10 @@ class FramesMixin:
                 else:
                     title = ("expert routing heat  (simulated - vllm does not "
                              "export router choices; colour = time since routed)")
+                # A box title is never cut mid-word: drop the parenthetical first.
+                if vis_len(" " + title + " ") > width - 4:
+                    short = title.split("  (")[0]
+                    title = short if vis_len(" " + short + " ") <= width - 4 else "expert heat"
                 for r in self.box(title, rows, width, t.accent):
                     A(clip(r, width))
 
