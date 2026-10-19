@@ -3902,7 +3902,17 @@ class FramesMixin:
         A(dline)
         A("")
 
-        # ---- big decode readout (llm-visuals: tall numerals on the FLOW ramp)
+        # ---- big decode readout (llm-visuals: tall numerals on the FLOW ramp).
+        # btop-style: full digits with room, one stat line on a short terminal.
+        stat = (self.pulse_head(int(time.time() * 2)) + " DECODE"
+                if cur.busy and gen > 0 else "  DECODE")
+        bar = self.gauge(min(1.0, gen / max(self.pk_gen, 0.5))
+                         if self.pk_gen else 0.0, 14)
+        dstat_line = clip("%s%s%s %s%*.1f t/s%s  %s  %speak %*.1f%s  %s%s tok total%s"
+                          % (t.label, stat, t.rst(),
+                             t.value + t.bold(), 6, gen, t.rst(),
+                             bar, t.frame, 6, self.pk_gen, t.rst(),
+                             t.label, human(cur.gen), t.rst()), width)
         if not height or height >= 26:
             if t.plain:
                 gcol = t.value if gen else t.frame
@@ -3912,15 +3922,10 @@ class FramesMixin:
             for r in self.big_digits(gen, max(18, width // 2 - 4),
                                      gcol if not t.plain else ""):
                 A(clip(r, width))
-            stat = (self.pulse_head(int(time.time() * 2)) + " DECODE"
-                    if cur.busy and gen > 0 else "  DECODE")
-            bar = self.gauge(min(1.0, gen / max(self.pk_gen, 0.5))
-                             if self.pk_gen else 0.0, 14)
-            A(clip("%s%s%s %s%*.1f t/s%s  %s  %speak %*.1f%s  %s%s tok total%s"
-                   % (t.label, stat, t.rst(),
-                      t.value + t.bold(), 6, gen, t.rst(),
-                      bar, t.frame, 6, self.pk_gen, t.rst(),
-                      t.label, human(cur.gen), t.rst()), width))
+            A(dstat_line)
+            A("")
+        elif height >= 20:
+            A(dstat_line)
             A("")
 
         # ---- acceptance
@@ -3940,32 +3945,34 @@ class FramesMixin:
                                           why, t.rst()), width))
         A("")
 
-        # ---- number grid: 3 columns wide, 1 column narrow
-        na = "n/a"
-        cells = [("tau acc length", "%.2f" % tau, t.heat(self.tf_frac(tau, k) if tfam else alpha)),
-                 ("draft window", na if tfam else "%.1f" % dwin, t.frame if tfam else t.value),
-                 ("spec tokens", "%d" % k, t.value),
-                 ("accepted t/s", "%.1f" % acc_ts, t.heat(0.9)),
-                 ("drafted t/s", na if tfam else "%.1f" % draft_ts, t.frame if tfam else t.label),
-                 ("waste ratio", na if tfam else "%.1f%%" % ((1 - alpha) * 100), t.frame if tfam else t.heat(alpha)),
-                 ("gen t/s", "%.1f" % gen, t.heat(0.9) if gen else t.frame),
-                 ("prompt t/s", "%.0f" % live["pf"],
-                  t.heat(0.7) if live["pf"] else t.frame),
-                 ("verify step/s", "%.1f" % steps, t.value if steps else t.frame)]
-        ncol = 3 if width >= self.NARROW else 1
-        cw = (width - 2 * (ncol - 1)) // ncol
-        for r in range(0, len(cells), ncol):
-            line = ""
-            for i in range(ncol):
-                if r + i >= len(cells):
-                    break
-                lab, val, col = cells[r + i]
-                line += pad("%s%-14s%s %s%s%s" % (t.label, lab, t.rst(),
-                                                  col + t.bold(), val, t.rst()), cw)
-                if i < ncol - 1:
-                    line += t.frame + "│ " + t.rst()
-            A(clip(line, width))
-        A("")
+        # ---- number grid: 3 columns wide, 1 column narrow. On a very short
+        # terminal the engine box matters more than the grid: skip it.
+        if not height or height >= 20:
+            na = "n/a"
+            cells = [("tau acc length", "%.2f" % tau, t.heat(self.tf_frac(tau, k) if tfam else alpha)),
+                     ("draft window", na if tfam else "%.1f" % dwin, t.frame if tfam else t.value),
+                     ("spec tokens", "%d" % k, t.value),
+                     ("accepted t/s", "%.1f" % acc_ts, t.heat(0.9)),
+                     ("drafted t/s", na if tfam else "%.1f" % draft_ts, t.frame if tfam else t.label),
+                     ("waste ratio", na if tfam else "%.1f%%" % ((1 - alpha) * 100), t.frame if tfam else t.heat(alpha)),
+                     ("gen t/s", "%.1f" % gen, t.heat(0.9) if gen else t.frame),
+                     ("prompt t/s", "%.0f" % live["pf"],
+                      t.heat(0.7) if live["pf"] else t.frame),
+                     ("verify step/s", "%.1f" % steps, t.value if steps else t.frame)]
+            ncol = 3 if width >= self.NARROW else 1
+            cw = (width - 2 * (ncol - 1)) // ncol
+            for r in range(0, len(cells), ncol):
+                line = ""
+                for i in range(ncol):
+                    if r + i >= len(cells):
+                        break
+                    lab, val, col = cells[r + i]
+                    line += pad("%s%-14s%s %s%s%s" % (t.label, lab, t.rst(),
+                                                      col + t.bold(), val, t.rst()), cw)
+                    if i < ncol - 1:
+                        line += t.frame + "│ " + t.rst()
+                A(clip(line, width))
+            A("")
 
         # ---- engine/session, history, rolling averages
         eng_body = [
@@ -4035,6 +4042,11 @@ class FramesMixin:
             ncols = 2
         else:
             ncols = 1
+        # A short terminal cannot afford the middle chart column (the heatmap is
+        # ~20 rows in narrow mode): drop to two columns before the widths are
+        # computed, so the right column can hold or shed the chart by its budget.
+        if ncols == 3 and height and (height - len(L)) < 22:
+            ncols = 2
         if ncols == 3:
             rest = width - 4 - need_l
             extra = max(0, rest - need_m - need_r)
@@ -4072,6 +4084,13 @@ class FramesMixin:
             while need > avail and len(eng_body) > 5:
                 eng_body.pop()
                 need -= 1
+            if need > avail:
+                cl = None       # no room even for the minimum: drop the box whole
+        if height and len(eng_body) + 2 > height - len(L):
+            # last resort on a tiny terminal: keep kv/prefix/ttft, the three
+            # rows that say whether the engine is alive at all
+            while len(eng_body) > 3 and len(eng_body) + 2 > height - len(L):
+                eng_body.pop()
         left_col = self.box("engine & session", eng_body, lw)
         if cl:
             left_col.append("")
@@ -4102,26 +4121,40 @@ class FramesMixin:
             for i in range(0, len(chunks), per):
                 body.append("".join(pad(c, cellw) for c in chunks[i:i + per]))
             return self.box("per-position acceptance  (%s)" % src, body, w, t.accent)
-        # RIGHT column: rolling averages + per-position are the must-keep boxes
-        # (per the user's layout request); history is shown on top only when there
-        # is room in the grid, so on a short wide terminal we drop history (the
-        # least-priority of the three) rather than rolling or per-position.
+        # Side column in visual order: history on top, rolling averages,
+        # per-position, then the day chart (when the chart is not the middle
+        # column). A btop-style row budget then drops the lowest-priority box
+        # whole - chart first, then per-position, then history - instead of
+        # L[:height] cutting one mid-box.
         hist_box = self.box("history", hist_body, rw) if hist_body else []
         avg_box = self.box("rolling averages", avg_body, rw)
-        pos_box = _pos_box(rw) if (posn and wide) else []
-        right_col = list(avg_box)
+        pos_box = _pos_box(rw) if posn else []
+        heat_in_col = bool(heat_box) and ncols == 2 and mw != width
+        heat_below = bool(heat_box) and ncols == 2 and mw == width
+        order = []
+        if hist_box:
+            order.append(("hist", hist_box + [""]))
+        order.append(("avg", avg_box))
         if pos_box:
-            right_col.append("")
-            right_col += pos_box
-        if wide and hist_box:
-            if not (height and (height - len(L)) < len(right_col) + len(hist_box) + 1):
-                right_col = list(hist_box) + [""] + right_col
-        if ncols == 2 and heat_box and mw != width:
-            # the heatmap is the first thing to go when the block would run past
-            # the terminal: it is a day chart, not a live gauge
-            if not height or (height - len(L)) >= max(len(left_col), len(right_col)) + len(heat_box) + 1:
-                right_col.append("")
-                right_col += heat_box
+            order.append(("pos", [""] + pos_box))
+        if heat_in_col:
+            order.append(("heat", [""] + heat_box))
+        if ncols == 3 and height and len(mid_col) > height - len(L):
+            mid_col = []
+        if height:
+            avail = height - len(L)
+            drops = ("heat", "pos", "hist", "avg") if ncols == 1 else ("heat", "pos", "hist")
+            for drop in drops:
+                if ncols >= 2:
+                    block = max(len(left_col),
+                                sum(len(b) for _n, b in order),
+                                len(mid_col) if ncols == 3 else 0)
+                else:
+                    block = len(left_col) + sum(len(b) for _n, b in order)
+                if block <= avail:
+                    break
+                order = [(n, b) for n, b in order if n != drop]
+        right_col = [ln for _n, block in order for ln in block]
         if ncols == 3:
             for i in range(max(len(left_col), len(mid_col), len(right_col))):
                 a = left_col[i] if i < len(left_col) else ""
@@ -4133,16 +4166,12 @@ class FramesMixin:
                 a = left_col[i] if i < len(left_col) else ""
                 c = right_col[i] if i < len(right_col) else ""
                 A(clip(pad(a, lw) + "  " + c, width))
-            if heat_box and mw == width:
+            if heat_below and (not height or (height - len(L))
+                               >= max(len(left_col), len(right_col)) + len(heat_box) + 1):
                 for r in heat_box:
                     A(clip(r, width))
         else:
-            for r in left_col:
-                A(clip(r, width))
-            if heat_box:
-                for r in heat_box:
-                    A(clip(r, width))
-            for r in right_col:
+            for r in left_col + right_col:
                 A(clip(r, width))
         A("")
 

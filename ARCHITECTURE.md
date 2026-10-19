@@ -95,8 +95,11 @@ once instead of waiting out the interval).
    slow generation.
 6. Every rendered line is `<= width` visible characters. `clip()` closes a
    colour run only when it cut one — plain (mono) output stays ANSI-free.
-7. Never return more rows than the terminal has (`L[:height]`); optional boxes
-   gate on the rows left.
+7. Never return more rows than the terminal has, and never cut a box
+   mid-frame: a row budget drops optional boxes whole (chart -> per-position ->
+   history, and averages only in the stacked layout), the big digits degrade to
+   a stat line below 26 rows, and the number grid is skipped below 20. Test 7b
+   counts box tops against bottoms at 4 widths x 7 heights.
 8. The grid is content-aware: each column asks for the width its own text needs
    (engine rows, cluster probe, averages line), the layout uses three columns
    only when they fit, else two, else stacked, and slack is shared. No fixed

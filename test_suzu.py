@@ -173,6 +173,13 @@ for h in (10, 20, 30, 60):
     lines = v.frame(130, h)
     ok("height=%-3d -> %d rows <= %d" % (h, len(lines), h), len(lines) <= h)
 
+print("\n--- 7b) height budget: no box is cut mid-frame (tops == bottoms)")
+for w in (89, 118, 130, 160):
+    for h in (16, 20, 24, 30, 40, 50, 60):
+        body = "\n".join(v.frame(w, h))
+        tops, bots = body.count("┌"), body.count("└")
+        ok("w=%-4d h=%-3d boxes %d/%d closed" % (w, h, tops, bots), tops == bots)
+
 print("\n--- 8) every theme in the cycle is multicolour, and its ramp is readable")
 for name in m.THEME_ORDER:
     tv = m.View(30001, 1.0, False, name)
