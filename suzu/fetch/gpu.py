@@ -29,7 +29,7 @@ def fetch_gpu():
     try:
         rows = []
         out = subprocess.run(
-            ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,",
+            ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,"
              "memory.total,power.draw,temperature.gpu,clocks.sm",
              "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=3).stdout

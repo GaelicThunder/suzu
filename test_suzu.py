@@ -623,5 +623,29 @@ _b = _v.bar(0.55, 10)
 ok("bar: 5 full, one dithered edge, 4 of track", _b == "█████▒░░░░", repr(_b))
 ok("bar: empty and full", _v.bar(0.0, 4) == "░░░░" and _v.bar(1.0, 4) == "████")
 
+print("\n--- 12d) gpu row: the nvidia-smi query is ONE argv element (split regression, 19-10)")
+import suzu.fetch.gpu as _G
+_seen = {}
+class _R:
+    def __init__(self, out):
+        self.stdout, self.stderr = out, ""
+def _fake_run(argv, **kw):
+    _seen["argv"] = argv
+    return _R("31, [N/A], [N/A], 33.6, 67, 2171\n")
+_orig = _G.subprocess.run
+_G.subprocess.run = _fake_run
+_G._GPU_SMI.update(at=0.0, rows=None)
+_row = _G.fetch_gpu()
+_G.subprocess.run = _orig
+_q = [a for a in _seen.get("argv", []) if a.startswith("--query-gpu=")]
+ok("gpu: query is one argument", len(_q) == 1 and all(f in _q[0] for f in
+   ("utilization.gpu", "memory.used", "memory.total", "power.draw", "temperature.gpu", "clocks.sm")),
+   repr(_seen.get("argv")))
+ok("gpu: parsed util/watts/temp/clock, [N/A] memory stays None",
+   bool(_row) and _row[0]["util"] == 31.0 and _row[0]["w"] == 33.6
+   and _row[0]["c"] == 67.0 and _row[0]["mhz"] == 2171.0 and _row[0]["mem"] is None,
+   repr(_row))
+_G._GPU_SMI.update(at=0.0, rows=None)
+
 print("\nRESULT: %s" % ("ALL OK" if not fails else "FAILED: %s" % fails))
 sys.exit(1 if fails else 0)
