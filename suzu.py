@@ -970,8 +970,12 @@ def model_config_path():
             model = cmd[cmd.index("serve") + 1] if cmd.index("serve") + 1 < len(cmd) else ""
             for mnt in mounts:
                 dst = (mnt.get("Destination") or "").rstrip("/")
-                if dst and model.startswith(dst + "/"):
-                    p = os.path.join(mnt.get("Source") or "", model[len(dst) + 1:], "config.json")
+                # `tensorfold serve /model` names the mount root itself, not a
+                # folder inside it - accept both shapes or the layer grid goes
+                # dark on every TensorFold box started that way.
+                if dst and (model == dst or model.startswith(dst + "/")):
+                    rel = "" if model == dst else model[len(dst) + 1:]
+                    p = os.path.join(mnt.get("Source") or "", rel, "config.json")
                     if os.path.exists(p):
                         return p
         for n in names:
