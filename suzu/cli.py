@@ -62,18 +62,22 @@ ours) . g = full-screen layer grid.
 
 usage: suzu.py [interval] [--port N] [--theme NAME] [--color auto|truecolor|256]
                [--tokens-db PATH] [--rank1-url URL] [--lanes-url URL]
-               [--no-log] [--once] [--list-themes] [--layers]
+               [--no-log] [--once] [--list-themes] [--layers] [--demo]
 keys:  t = cycle theme   l = toggle log   L = layer grid   g = full-screen layer grid
        p = performance zoom   b = token pipeline   q = quit
 
 The code lives in this package (see ARCHITECTURE.md); this module is the
 command line front end and the redraw loop.
 """
+import atexit
 import os
 import select
 import signal
+import socket
+import subprocess
 import sys
 import time
+from urllib.request import urlopen
 
 from .ansi import ESC, RST
 from . import config
@@ -112,8 +116,67 @@ def term_size(fallback=(100, 40)):
     return os.terminal_size((cols or fallback[0], lines or fallback[1]))
 
 
+def _free_port():
+    """A port the kernel says is free right now (bind to 0, read it, release)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+    finally:
+        s.close()
+
+
+_DEMO = []
+
+
+def _demo_stop():
+    for proc in _DEMO:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+    _DEMO.clear()
+
+
+def _demo_start(port, port_given):
+    """Start demo/fake_engine.py next to the script; return the port to watch.
+
+    The repo ships the synthetic engine; a bare `curl` of suzu.py does not.
+    Returns None on failure (the reason is already on stderr).
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    cand = [os.path.join(here, "demo", "fake_engine.py"),
+            os.path.join(here, os.pardir, "demo", "fake_engine.py")]
+    script = next((p for p in cand if os.path.isfile(p)), None)
+    if script is None:
+        sys.stderr.write("--demo: demo/fake_engine.py not found next to suzu.py "
+                         "(it ships in the repo; a lone suzu.py has no demo)\n")
+        return None
+    if not port_given:
+        port = _free_port()
+    proc = subprocess.Popen([sys.executable, script, "--port", str(port)],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    _DEMO.append(proc)
+    atexit.register(_demo_stop)
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            sys.stderr.write("--demo: fake engine exited (code %s)\n" % proc.returncode)
+            return None
+        try:
+            with urlopen("http://127.0.0.1:%d/health" % port, timeout=0.5):
+                return port
+        except Exception:
+            time.sleep(0.1)
+    sys.stderr.write("--demo: fake engine did not answer on :%d within 5s\n" % port)
+    return None
+
+
 def main():
     port, interval, show_log, once = 30001, 1.0, True, False
+    demo, port_given = False, False
     layers = False
     theme = _theme_read() or os.environ.get("SUZU_THEME_NAME") or "yuzu"
     color_mode = None
@@ -126,8 +189,10 @@ def main():
         if a == "--port":
             i += 1
             port = int(args[i])
+            port_given = True
         elif a.startswith("--port="):
             port = int(a.split("=", 1)[1])
+            port_given = True
         elif a == "--theme":
             i += 1
             theme = args[i]
@@ -162,6 +227,8 @@ def main():
             lanes_url = a.split("=", 1)[1]
         elif a in ("--layers", "-g"):
             layers = True
+        elif a == "--demo":
+            demo = True
         elif a in ("-h", "--help"):
             print(__doc__)
             return 0
@@ -179,6 +246,12 @@ def main():
             interval = max(0.25, float(rest[0]))
         except ValueError:
             pass
+
+    if demo:
+        got = _demo_start(port, port_given)
+        if got is None:
+            return 2
+        port = got
 
     if tokens_db:
         config.HERMES_DB = os.path.expanduser(tokens_db)

@@ -38,8 +38,15 @@ precisely — and where most monitors silently show you stale data. suzu doesn't
 ## Try it in 30 seconds — no GPU, no model
 
 The repo ships a synthetic engine that speaks llama.cpp's wire format,
-speculative decoding included — plus a generator for synthetic token-usage
-history, so the Token Gen heatmap renders too:
+speculative decoding included. `--demo` starts it for you and cleans it up on
+exit:
+
+```bash
+python3 suzu.py --demo        # the bell + its fake engine, one command
+```
+
+Prefer the parts separately (or want the Token Gen heatmap)? The generator for
+synthetic token-usage history lives in `demo/` too:
 
 ```bash
 python3 demo/fake_engine.py --port 8099                       # terminal 1: a fake engine
