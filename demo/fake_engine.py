@@ -19,7 +19,14 @@ from urllib.parse import urlparse
 AP = argparse.ArgumentParser()
 AP.add_argument("--port", type=int, default=8099)
 AP.add_argument("--model", default="Qwen3.5-32B-Instruct-Q4_K_M")
-AP.add_argument("--draft", default="Qwen3.5-0.8B-DFlash")
+AP.add_argument("--draft", "--spec-draft-model", dest="draft",
+                default="Qwen3.5-0.8B-DFlash",
+                help="draft model name (llama.cpp spells it --spec-draft-model; "
+                     "suzu reads the engine cmdline, so pass it the way a real server does)")
+AP.add_argument("--spec-type", default="draft-mtp",
+                help="speculative method, as llama.cpp's --spec-type")
+AP.add_argument("--spec-draft-n-max", dest="spec_k", type=int, default=5,
+                help="draft tokens per round (the engine drafts exactly this many)")
 AP.add_argument("--ctx", type=int, default=131072)
 AP.add_argument("--lanes", action="store_true", help="also serve a /yzq/stats-style lanes JSON")
 A = AP.parse_args()
@@ -162,6 +169,6 @@ class H(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    print("fake_engine: %s + draft %s on :%d%s" % (A.model, A.draft, A.port,
-                                                   " (lanes on)" if A.lanes else ""))
+    print("fake_engine: %s + draft %s (%s) on :%d%s" % (
+        A.model, A.draft, A.spec_type, A.port, " (lanes on)" if A.lanes else ""))
     ThreadingHTTPServer(("127.0.0.1", A.port), H).serve_forever()
