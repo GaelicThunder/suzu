@@ -7,19 +7,45 @@ dictates the tool's design and would otherwise only show up in production:
 
 run: python3 test_suzu.py     (exit 0 = all good)
 """
-import importlib.util
 import json
 import os
 import sys
 
-sp = importlib.util.spec_from_file_location(
-    'sl', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'suzu.py'))
-m = importlib.util.module_from_spec(sp)
-sp.loader.exec_module(m)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import suzu as m
+import suzu.fetch.engine
+import suzu.fetch.http
+import suzu.fetch.info
+import suzu.fetch.logtail
+import suzu.fetch.memory
+import suzu.fetch.rank1
+import suzu.fetch.tabby
+import suzu.fetch.tensorfold
+import suzu.fetch.vllm
+import suzu.render.core
+import suzu.render.frames
+import suzu.render.panels
+
+# The split put the code in submodules: `suzu.http_get` is a re-export, not the
+# binding core.step() looks up. patch() writes a fake into every module that
+# imported that name, so a test patches the behaviour the code actually calls
+# instead of only the package facade.
+_TARGETS = [m, suzu.fetch.engine, suzu.fetch.http, suzu.fetch.info,
+            suzu.fetch.logtail, suzu.fetch.memory, suzu.fetch.rank1,
+            suzu.fetch.tabby, suzu.fetch.tensorfold, suzu.fetch.vllm,
+            suzu.render.core, suzu.render.frames, suzu.render.panels]
+
+
+def patch(name, value):
+    for mod in _TARGETS:
+        if hasattr(mod, name):
+            setattr(mod, name, value)
+
+
 # the theme cycling in test 9 goes through cycle_theme(), which SAVES the theme: pointed at the real file it overwrote
 # the one picked with `t` on every run of this suite (30-09). The tests get their own file.
 import tempfile as _tf
-m.THEME_STATE = _tf.NamedTemporaryFile(prefix="suzu-theme-", delete=False).name
+patch("THEME_STATE", _tf.NamedTemporaryFile(prefix="suzu-theme-", delete=False).name)
 
 STATE = {"dec": 0, "draft": 1000.0, "acc": 440.0, "drafts": 200.0,
          "pos": [150.0, 110.0, 80.0, 57.0, 43.0], "gen": 5000.0, "busy": True}
@@ -49,13 +75,13 @@ def fake_slots():
                         "next_token": [{"n_decoded": s["dec"]}]}])
 
 
-m.http_get = lambda url, timeout=4, tries=2: fake_slots() if "/slots" in url else fake_metrics()
-m.server_info = lambda port: {"draft": "/fake/drafter.gguf", "spec": "draft-dspark",
+patch("http_get", lambda url, timeout=4, tries=2: fake_slots() if "/slots" in url else fake_metrics())
+patch("server_info", lambda port: {"draft": "/fake/drafter.gguf", "spec": "draft-dspark",
                               "k": "5", "up": 3600, "model": "/fake/m.gguf",
-                              "engine": "llama-server"}
+                              "engine": "llama-server"})
 
 # no rank-1 HTTP from the tests: the rank-1 feed is tested on its own in 11c
-m.fetch_rank1 = lambda url=None, tf=False: {"up": None, "telemetry": "connecting"}
+patch("fetch_rank1", lambda url=None, tf=False: {"up": None, "telemetry": "connecting"})
 v = m.View(30001, 1.0, False)
 CLOCK = [1000.0]
 m.time.time = lambda: CLOCK[0]           # deterministic clock
@@ -259,10 +285,10 @@ except OSError:
     pass
 tab_reset()
 tab_write(tab_rec(206, "10.8", 137984, 312, "150.72", "23.62", 138296))
-m.http_get = tab_http
-m.active_log = lambda llm: TAB_LOG
-m.server_info = lambda port: {"draft": None, "spec": "disabled", "k": None,
-                              "up": 900, "model": None, "engine": "tabby/exl3"}
+patch("http_get", tab_http)
+patch("active_log", lambda llm: TAB_LOG)
+patch("server_info", lambda port: {"draft": None, "spec": "disabled", "k": None,
+                              "up": 900, "model": None, "engine": "tabby/exl3"})
 tv = m.View(30001, 1.0, False, "mono")
 
 
@@ -344,11 +370,11 @@ print("\n--- 10g) long prefill: /props mute but the process is there -> panel AL
 # seconds, and switching off exactly then would be the defect this file exists
 # to avoid. The fallback is the process environment, where the launcher wrote
 # TABBY_MODEL_MAX_SEQ_LEN: not an estimate, the number the server received.
-m.http_get = lambda url, timeout=4, tries=2: (
+patch("http_get", lambda url, timeout=4, tries=2: (
     None if "/props" in url or "/metrics" in url
     else json.dumps({"high": 0, "low": 0, "inflight": TAB["inflight"],
-                     "sse_total": TAB["sse_total"], "served": 1}))
-m.tabby_env = lambda: {"TABBY_MODEL_MAX_SEQ_LEN": "262144"}
+                     "sse_total": TAB["sse_total"], "served": 1})))
+patch("tabby_env", lambda: {"TABBY_MODEL_MAX_SEQ_LEN": "262144"})
 m._TABBY_PROPS.clear()
 tab_reset()
 tab_write(tab_rec(206, "10.8", 137984, 312, "150.72", "23.62", 138296))
@@ -360,7 +386,7 @@ if r3:
     check("n_ctx from the process environment", r3[0].ctxmax, 262144.0)
 
 print("\n--- 10h) engine really down: no /props, no process -> None")
-m.tabby_env = lambda: {}
+patch("tabby_env", lambda: {})
 m._TABBY_PROPS.clear()
 tv4 = m.View(30001, 1.0, False, "mono")
 CLOCK[0] += 1
@@ -404,9 +430,9 @@ tensorfold_prompt_tokens_total 247397
 tensorfold_cached_tokens_total 156928
 tensorfold_requests_inflight 0"""
 m._TF_MONO.update(gen=0.0, comp=0.0)
-m.vllm_ctxmax = lambda port: 1048576
-m.tf_last_record = lambda path=None: {}
-m.tf_lifetime = lambda path=None: None
+patch("vllm_ctxmax", lambda port: 1048576)
+patch("tf_last_record", lambda path=None: {})
+patch("tf_lifetime", lambda path=None: None)
 mx3, sl3 = m.synth_tensorfold(m.parse_metrics(OLD), 8888, None)
 ok("jayleaton: accepted = completion - req - rounds", mx3.get("llamacpp:spec_decode_num_accepted_tokens_total") == 7936.0 - 6 - 3656)
 ok("jayleaton: no drafted, stays tokens/round", m.Sample(mx3, sl3, 0.0).tf_nodraft)
@@ -414,7 +440,7 @@ ok("jayleaton: no drafted, stays tokens/round", m.Sample(mx3, sl3, 0.0).tf_nodra
 print("\n--- 11b) newer kit: no double-counting in flight, live prefill from /health \"fill\" (image y3)")
 HEALTH = {"v": {"streams": {"decoding": 1, "filling": 1}, "fill": [{"sid": 3, "pos": 20480, "prompt": 138000}]}}
 _old_get = m.http_get
-m.http_get = lambda url, timeout=4, tries=2: json.dumps(HEALTH["v"]) if url.endswith("/health") else ""
+patch("http_get", lambda url, timeout=4, tries=2: json.dumps(HEALTH["v"]) if url.endswith("/health") else "")
 m._TF_FILL.update(pos={}, done=0.0)
 m._TF_MONO.update(gen=0.0, comp=0.0)
 yzq = {"running": [{"sse": 500}]}
@@ -431,7 +457,7 @@ ok("kit: new prompt resumed from cache is not prefill", slc[0]["n_prompt_tokens_
 HEALTH["v"] = {"streams": {"decoding": 1, "filling": 1}}
 mxd, sld = m.synth_tensorfold(m.parse_metrics(MIA), 8888, yzq)
 ok("kit on y2: only the stream count", mxd.get("tensorfold:fill_streams") == 1.0 and "tensorfold:fill_len" not in mxd)
-m.http_get = _old_get
+patch("http_get", _old_get)
 
 print("\n--- 11c) TP cluster (05-10): rank 1 from a background HTTP poller, never from the render loop; the link from RoCE")
 import os as _os, re as _re, json as _json, types

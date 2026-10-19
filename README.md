@@ -131,8 +131,9 @@ cannot see, because a gateway answers before its scheduler ever touches the engi
 
 ## Themes
 
-`t` cycles live; `--theme NAME` picks one; `--list-themes` lists all ten. The
-default `yuzu` theme is the warm one above; `neon` is the classic forum-panel look.
+`t` cycles live; `--theme NAME` picks one; `--list-themes` lists all eleven. The
+default `yuzu` theme is the warm one above; `neon` is the classic forum-panel look;
+`phosphor` is the green/amber EVA-style CRT, with its own phosphor ramps.
 
 | yuzu | neon | matrix | amber | ice |
 |---|---|---|---|---|
@@ -146,10 +147,24 @@ Themes persist to `~/.config/suzu/theme` (`SUZU_THEME` overrides the path).
 ## Adding an engine
 
 Every supported engine is an adapter of ~100 lines mapping your endpoints onto
-the shared panel keys — see the `synth_*` adapters in `suzu.py`, and
-`test_suzu.py`, an offline harness that drives adapters against a synthetic
-engine (115 checks, no server needed). If your engine exposes `/metrics` or a
-log line, suzu can show it. PRs welcome.
+the shared panel keys — see `suzu/fetch/` (one module per engine) and
+`ARCHITECTURE.md` for the map and the recipe. `test_suzu.py` is an offline
+harness that drives the adapters against a synthetic engine (100+ checks, no
+server needed). If your engine exposes `/metrics` or a log line, suzu can show
+it. PRs welcome.
+
+## Development
+
+`suzu/` is the source; `suzu.py` is generated, so edit the package, not the
+release file:
+
+```bash
+python3 tools/bundle.py     # rebuild suzu.py
+python3 test_suzu.py        # offline suite, exit 0 = all good
+```
+
+`ARCHITECTURE.md` has the module map, one tick's data flow, the laws the tests
+enforce, and how to add an engine, a theme or a panel.
 
 ## Provenance
 

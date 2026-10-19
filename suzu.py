@@ -2,15 +2,9 @@
 """suzu - a small bell for your LLM engine: live monitor for a
 speculative-decoding inference server.
 
-This is the public single-file release of an internal tool.
+*** GENERATED FILE - edit suzu/ and run tools/bundle.py, not this file. ***
 
-The full-screen speculative-decoding panel idea comes from a dashboard posted
-in the NVIDIA DGX Spark forum thread; the 2026-09 rework borrowed visual ideas
-from DingoOz/llm-visuals (MIT): half-block big digits, VU gauges with
-peak-hold, attack/release fade, the expert heat map, theme-aware RGB ramps,
-and the views (`p` performance, `b` token pipeline).
-
-*** The measurement that dictates this file's whole architecture ***
+The measurement that dictates this file's whole architecture:
 llama.cpp's /metrics counters DO NOT MOVE during a generation. They are
 flushed at request completion. Measured: 6.2 s of active slot produced delta
 0 on tokens_predicted_total and on every spec_decode_* counter, while the
@@ -39,73 +33,168 @@ Sources, all already exposed - no engine patch required:
             probed only when the cmdline says --nnodes 2: the cluster is
             only as alive as its quietest rank
 
-*** 29-08: TabbyAPI/exllamav3 (entry glm53x, the daily driver at the time)
-exposes NONE of this - /metrics and /slots answer 404. The `tabby` branch
-below (synth_tabby) rebuilds the same keys from /props + the gateway stats +
-the `Metrics (ID: ...)` line in the engine log, so the rest of the file does
-not change. Live tokens come from the gateway, the only component that sees
-them pass.
-
-*** 30-09: TensorFold (entry glm53tf, the main engine since) has /metrics
-but in its own words (tensorfold_*), flushed at request close like
-llama.cpp, and no /slots. synth_tensorfold maps it onto the same keys:
-closed counters from /metrics, the in-flight part from the gateway's SSE
-events (one event per verify round) times tokens/round, the last request's
-prompt/cached from its request log. It counts no drafted tokens, so the
-panel shows tokens/round instead of an acceptance percentage.
-The same request log gives the all-time totals (`since DD-MM` row), which
-survive engine restarts; the /metrics ones start again at every boot.
-
-Views:  full (default) . p = performance zoom . b = token pipeline (vertical
-VU meters + bottleneck verdict, the repo's bandwidth view adapted to GB10
-unified memory: no PCIe hop, but the gateway lanes and the rank-1 link are
-ours) . g = full-screen layer grid.
-
-usage: suzu.py [interval] [--port N] [--theme NAME] [--color auto|truecolor|256]
-               [--tokens-db PATH] [--rank1-url URL] [--lanes-url URL]
-               [--no-log] [--once] [--list-themes] [--layers]
-keys:  t = cycle theme   l = toggle log   L = layer grid   g = full-screen layer grid
-       p = performance zoom   b = token pipeline   q = quit
+See ARCHITECTURE.md for the module map; this file is those modules inlined.
 """
+
 import json
 import os
 import re
 import select
-import shutil
-import signal
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
 from collections import deque
+import signal
 
-try:
-    import termios
-    import tty
-    HAVE_TTY = True
-except ImportError:                     # not a POSIX terminal - keys disabled
-    HAVE_TTY = False
+# ==================== suzu/ansi.py
+"""ANSI primitives: SGR helpers, regexes, escape constants."""
+
+
 
 ESC = "\033["
+
+
+
 RST = ESC + "0m"
+
 
 
 def fg(n):
     return ESC + "38;5;%dm" % n
 
 
+
 def bg(n):
     return ESC + "48;5;%dm" % n
 
 
+
 BOLD = ESC + "1m"
+
+
+
 DIM = ESC + "2m"
 
-# --------------------------------------------------------------- themes ----
-# A theme maps semantic ROLES to colours, plus a 5-step scale used by every
-# "how good is this number" bar. Render code never hardcodes a colour - it asks
-# the theme, so adding a theme is one table entry and nothing else.
+
+
+ANSI_RE = re.compile(r"\033\[[0-9;?]*[a-zA-Z]")
+
+
+
+SGR_RE = re.compile(r"\033\[[0-9;]*m")
+
+# ==================== suzu/text.py
+"""Text measurement and formatting: visible width, pad, clip, units."""
+
+
+
+def vis_len(s):
+    return len(SGR_RE.sub("", s))
+
+
+
+def pad(s, w):
+    n = w - vis_len(s)
+    return s + " " * n if n > 0 else s
+
+
+
+def clip(s, w):
+    """Truncate by VISIBLE characters - len() lies on coloured strings."""
+    if w <= 0:
+        return ""
+    if vis_len(s) <= w:
+        return s
+    out, seen, i, had = [], 0, 0, False
+    while i < len(s) and seen < w:
+        if s[i] == "\033":
+            j = s.find("m", i)
+            if j < 0:
+                break
+            out.append(s[i:j + 1])
+            had = True
+            i = j + 1
+            continue
+        out.append(s[i])
+        seen += 1
+        i += 1
+    # A cut can land inside a coloured run, so close it - but only when the
+    # string had any escape at all: appending RST unconditionally painted a
+    # reset into plain (mono) output and broke the "no ANSI in mono" contract.
+    return "".join(out) + (RST if had else "")
+
+
+
+def human(n):
+    return "{:,}".format(int(n))
+
+
+
+def si_bytes(n):
+    """Bytes the short way: 950 B, 12.3 kB, 456 MB, 1.23 GB (decimal units, like the link's line rate)."""
+    n = float(n or 0)
+    for unit, div in (("GB", 1e9), ("MB", 1e6), ("kB", 1e3)):
+        if n >= div:
+            v = n / div
+            return ("%.2f %s" if v < 10 else "%.1f %s" if v < 100 else "%.0f %s") % (v, unit)
+    return "%.0f B" % n
+
+
+
+def fmt_hms(sec):
+    if sec is None:
+        return "--:--"
+    h, rem = divmod(int(sec), 3600)
+    m, s = divmod(rem, 60)
+    return "%dh%02dm" % (h, m) if h else "%02d:%02d" % (m, s)
+
+
+
+def ago(sec):
+    if sec is None:
+        return "never"
+    if sec < 90:
+        return "%.0fs ago" % sec
+    if sec < 5400:
+        return "%.0fm ago" % (sec / 60)
+    return "%.1fh ago" % (sec / 3600)
+
+# ==================== suzu/config.py
+"""Runtime configuration set by the CLI (paths/URLs)."""
+
+
+
+TF_REQLOG = os.path.expanduser("~/models/glm53-tf/sessions/requests.jsonl")
+
+
+
+HERMES_DB = os.path.expanduser("~/.hermes/state.db")   # --tokens-db overrides
+
+
+
+LANES_URL = None        # optional gateway lanes endpoint (--lanes-url)
+
+
+
+RANK1_URL = None        # optional rank-1 metrics endpoint (--rank1-url)
+
+
+class _Config:
+    pass
+
+
+config = _Config()
+for _k in ('TF_REQLOG', 'HERMES_DB', 'LANES_URL', 'RANK1_URL'):
+    setattr(config, _k, globals()[_k])
+del _k
+
+# ==================== suzu/themes.py
+"""Themes: role->colour tables, the 5-step quality ramp, truecolor ramps."""
+
+
+
 THEMES = {
     # Every theme is multicolour ON PURPOSE. "scale" is the semantic ramp
     # bad -> good, and it is the only thing that tells you WHAT a bar is worth:
@@ -133,6 +222,11 @@ THEMES = {
         "title": fg(214), "accent": fg(208), "head": fg(180), "frame": fg(94),
         "label": fg(137), "value": fg(223),
         "scale": [fg(124), fg(166), fg(214), fg(226), fg(154)],
+    },
+    "phosphor": {                   # green/amber phosphor, EVA terminal (19-10)
+        "title": fg(46), "accent": fg(214), "head": fg(184), "frame": fg(28),
+        "label": fg(64), "value": fg(120),
+        "scale": [fg(130), fg(178), fg(184), fg(82), fg(46)],
     },
     "ice": {
         "title": fg(45), "accent": fg(51), "head": fg(39), "frame": fg(24),
@@ -172,23 +266,34 @@ THEMES = {
         "value": "", "scale": ["", "", "", "", ""],
     },
 }
-THEME_ORDER = ["yuzu", "neon", "matrix", "amber", "ice", "grape",
+
+
+
+THEME_ORDER = ["yuzu", "neon", "matrix", "amber", "phosphor", "ice", "grape",
                "sunset", "oxide", "vapor", "paper"]
 
+
+
 BLOCKS = "▁▂▃▄▅▆▇█"
+
+
+
 DITHER = ("·", "░", "▒", "▓", "█")          # empty, then dithered density: the heatmap's levels and every bar's edge
+
+
+
 PULSE = "◐◓◑◒"          # pulsing head on the context row while the engine works
 
-# ------------------------------------------------- truecolor (llm-visuals) --
-# Port of src/colors.rs: ramps are RGB with piecewise lerp, degraded to the
-# nearest xterm-256 cube when the terminal does not advertise truecolor, and
-# to no colour at all in mono. Same stop values as upstream.
+
+
 def _rgb(t):
     return ESC + "38;2;%d;%d;%dm" % t
 
 
+
 def _lerp_rgb(a, b, t):
     return tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3))
+
 
 
 def _grad(stops, pos):
@@ -200,14 +305,20 @@ def _grad(stops, pos):
     return stops[-1][1]
 
 
+
 def _rgb256(t):
     """Nearest 6x6x6 xterm cube cell for an RGB triple."""
     q = [min(5, int(round(v / 255.0 * 5))) for v in t]
     return 16 + 36 * q[0] + 6 * q[1] + q[2]
 
 
+
 _TRUECOLOR = None
+
+
+
 _COLOR_MODE = None          # None = auto, else "truecolor" | "256" | "off"
+
 
 
 def set_color_mode(mode):
@@ -215,6 +326,7 @@ def set_color_mode(mode):
     _COLOR_MODE = mode if mode in ("truecolor", "256", "off") else None
     global _TRUECOLOR
     _TRUECOLOR = None
+
 
 
 def _have_truecolor():
@@ -229,6 +341,7 @@ def _have_truecolor():
     return _TRUECOLOR
 
 
+
 def _col(t):
     """RGB tuple -> SGR; truecolor when advertised, else the nearest
     256-cube cell (also forced by --color 256 / --color off)."""
@@ -237,25 +350,69 @@ def _col(t):
     return fg(_rgb256(t))
 
 
+
 HEAT_COOL = [(0.00, (20, 24, 44)), (0.18, (36, 58, 170)), (0.42, (0, 190, 235)),
              (0.66, (120, 240, 140)), (0.84, (255, 200, 50)), (1.00, (255, 250, 240))]
+
+
+
 HEAT_GOLD = [(0.00, (26, 22, 12)), (0.18, (94, 66, 16)), (0.42, (176, 128, 28)),
              (0.66, (228, 168, 54)), (0.84, (255, 208, 63)), (1.00, (255, 248, 225))]
+
+
+
 VU_COOL = [(0.00, (40, 200, 110)), (0.55, (140, 230, 80)), (0.72, (255, 200, 40)),
            (0.88, (255, 120, 50)), (1.00, (255, 60, 80))]
+
+
+
 VU_GOLD = [(0.00, (146, 176, 58)), (0.55, (214, 186, 44)), (0.72, (244, 208, 63)),
            (0.88, (236, 148, 44)), (1.00, (224, 96, 52))]
+
+
+
 FLOW_COOL = [(0.00, (90, 70, 200)), (0.45, (0, 190, 255)),
              (0.80, (120, 250, 230)), (1.00, (255, 255, 255))]
+
+
+
 FLOW_GOLD = [(0.00, (122, 92, 22)), (0.45, (201, 162, 39)),
              (0.80, (244, 208, 63)), (1.00, (255, 248, 225))]
-# Warm-ramp family: the yuzu-box identity (limone) and the themes that share
-# its temperament. Cool themes keep the upstream ocean ramps. Every ramp call
-# goes through the View, so the whole panel switches family with the theme.
+
+
+
 GOLD_FAMILY = {"yuzu", "amber", "sunset", "oxide"}
+
+
+PHOSPHOR_FAMILY = {"phosphor"}
+
+
+HEAT_PHOS = [(0.00, (8, 18, 10)), (0.18, (14, 60, 30)), (0.42, (30, 140, 60)),
+             (0.66, (120, 220, 90)), (0.84, (240, 220, 80)), (1.00, (255, 250, 220))]
+
+
+VU_PHOS = [(0.00, (40, 200, 90)), (0.55, (150, 230, 80)), (0.72, (250, 200, 50)),
+           (0.88, (255, 140, 40)), (1.00, (255, 70, 60))]
+
+
+FLOW_PHOS = [(0.00, (10, 60, 30)), (0.45, (40, 200, 90)),
+             (0.80, (190, 250, 140)), (1.00, (255, 255, 230))]
+
+
+TRACK_BG_PHOS = (14, 30, 18)
+
+
+
 TRACK_BG_COOL = (36, 40, 54)
+
+
+
 TRACK_BG_GOLD = (52, 44, 26)
+
+
+
 WHITE_FG = (250, 250, 255)
+
 
 
 def _bg_col(t):
@@ -264,7 +421,7 @@ def _bg_col(t):
     return bg(_rgb256(t))
 
 
-# Half-block 3-row digits, verbatim glyph shapes from src/render.rs big_digits
+
 BIG_GLYPHS = {
     "0": ["▄▀▄", "█ █", "▀▀▀"], "1": ["▄█ ", " █ ", "▀▀▀"],
     "2": ["▀▀▄", "▄▀ ", "▀▀▀"], "3": ["▀▀▄", " ▀▄", "▀▀ "],
@@ -275,37 +432,13 @@ BIG_GLYPHS = {
 }
 
 
-def _smooth(prev, target, dt, tau_up, tau_down):
-    """Exponential approach, fast up / slow down - fade.rs smooth()."""
-    tau = tau_up if target > prev else tau_down
-    a = 1.0 - 2.718281828459045 ** (-dt / max(tau, 0.001))
-    v = prev + (target - prev) * a
-    return max(0.0, min(1.0, v))
-
-
-def _routed_indices(layer, step, n_experts, k):
-    """fade.rs routed_indices(): deterministic LCG spread, same constants."""
-    if n_experts == 0:
-        return []
-    k = max(1, min(k, n_experts))
-    M = (1 << 64) - 1
-    x = ((layer * 0x9E3779B1) ^ (step * 0x85EBCA6B)) & M
-    out, guard = [], 0
-    while len(out) < k and guard < k * 8:
-        x = (x * 6364136223846793005 + 1442695040888963407) & M
-        e = (x >> 33) % n_experts
-        if e not in out:
-            out.append(e)
-        guard += 1
-    return out
-
-
-def _bigfont():
-    return True
-
 
 BIGFONT = True
+
+
+
 THEME_STATE = os.environ.get("SUZU_THEME", os.path.expanduser("~/.config/suzu/theme"))
+
 
 
 def _theme_read():
@@ -318,6 +451,7 @@ def _theme_read():
         return None
 
 
+
 def _theme_save(name):
     try:
         with open(THEME_STATE, "w") as f:
@@ -325,8 +459,6 @@ def _theme_save(name):
     except OSError:
         pass   # cosmetic state; a failed save must never kill the view
 
-ANSI_RE = re.compile(r"\033\[[0-9;?]*[a-zA-Z]")
-SGR_RE = re.compile(r"\033\[[0-9;]*m")
 
 
 class Theme:
@@ -375,71 +507,11 @@ class Theme:
     def dim(self):
         return "" if self.plain else DIM
 
-
-# ------------------------------------------------------------------ text ----
-def vis_len(s):
-    return len(SGR_RE.sub("", s))
+# ==================== suzu/fetch/http.py
+"""HTTP + Prometheus text parsing shared by every engine adapter."""
 
 
-def pad(s, w):
-    n = w - vis_len(s)
-    return s + " " * n if n > 0 else s
 
-
-def clip(s, w):
-    """Truncate by VISIBLE characters - len() lies on coloured strings."""
-    if w <= 0:
-        return ""
-    if vis_len(s) <= w:
-        return s
-    out, seen, i = [], 0, 0
-    while i < len(s) and seen < w:
-        if s[i] == "\033":
-            j = s.find("m", i)
-            if j < 0:
-                break
-            out.append(s[i:j + 1])
-            i = j + 1
-            continue
-        out.append(s[i])
-        seen += 1
-        i += 1
-    return "".join(out) + RST
-
-
-def human(n):
-    return "{:,}".format(int(n))
-
-
-def si_bytes(n):
-    """Bytes the short way: 950 B, 12.3 kB, 456 MB, 1.23 GB (decimal units, like the link's line rate)."""
-    n = float(n or 0)
-    for unit, div in (("GB", 1e9), ("MB", 1e6), ("kB", 1e3)):
-        if n >= div:
-            v = n / div
-            return ("%.2f %s" if v < 10 else "%.1f %s" if v < 100 else "%.0f %s") % (v, unit)
-    return "%.0f B" % n
-
-
-def fmt_hms(sec):
-    if sec is None:
-        return "--:--"
-    h, rem = divmod(int(sec), 3600)
-    m, s = divmod(rem, 60)
-    return "%dh%02dm" % (h, m) if h else "%02d:%02d" % (m, s)
-
-
-def ago(sec):
-    if sec is None:
-        return "never"
-    if sec < 90:
-        return "%.0fs ago" % sec
-    if sec < 5400:
-        return "%.0fm ago" % (sec / 60)
-    return "%.1fh ago" % (sec / 3600)
-
-
-# ---------------------------------------------------------------- fetch ----
 def http_get(url, timeout=4, tries=2):
     """With -np 1 the HTTP handler can wait on the in-flight decode, so an
     isolated timeout is NOT a dead engine - retry before declaring one."""
@@ -453,8 +525,13 @@ def http_get(url, timeout=4, tries=2):
     return None
 
 
+
 METRIC_RE = re.compile(r'^([a-zA-Z_:][\w:]*)(\{[^}]*\})?\s+([-\d.eE+]+)\s*$')
+
+
+
 POS_RE = re.compile(r'position="(\d+)"')
+
 
 
 def parse_metrics(text):
@@ -482,6 +559,7 @@ def parse_metrics(text):
     return out
 
 
+
 def gl(mx, name, *subs):
     """First metric whose key is `name` carrying every one of `subs` in its
     labels. parse_metrics aliases the bare name to whichever label set it saw
@@ -494,11 +572,635 @@ def gl(mx, name, *subs):
     return None
 
 
+
 def g(mx, *names):
     for n in names:
         if n in mx:
             return mx[n]
     return 0.0
+
+# ==================== suzu/fetch/memory.py
+"""Host memory, process RSS and llama.cpp /slots."""
+
+
+
+_MEMINFO = {"at": 0.0, "info": None, "pid": None}
+
+
+
+def fetch_memory(pid=None):
+    """Host memory picture, /proc only - the repo's RAM stage adapted to
+    GB10 unified memory, where nvidia-smi reports VRAM as [N/A] because the
+    weights and the desktop swim in the same pool. The engine number is its
+    full resident set (RssFile+RssAnon): on GB10 the weights sit in CUDA
+    unified memory, which RSS cannot tag as 'file', so RssFile alone would
+    show a meaningless ~0.4 GB."""
+    now = time.time()
+    if _MEMINFO["info"] is not None and now - _MEMINFO["at"] < 2.0 \
+            and _MEMINFO["pid"] == pid:
+        return _MEMINFO["info"]
+    mi = {"total": None, "avail": None, "used_frac": None, "rss": None}
+    try:
+        with open("/proc/meminfo") as f:
+            vals = {}
+            for line in f:
+                k, _, rest = line.partition(":")
+                vals[k.strip()] = float(rest.split()[0])   # kB
+        mi["total"] = vals.get("MemTotal")
+        mi["avail"] = vals.get("MemAvailable")
+        if mi["total"]:
+            used = mi["total"] - (mi["avail"] or 0.0)
+            mi["used_frac"] = max(0.0, min(1.0, used / mi["total"]))
+    except (OSError, ValueError):
+        pass
+    if pid:
+        try:
+            with open("/proc/%s/status" % pid) as f:
+                rf = ra = None
+                for line in f:
+                    if line.startswith("RssFile:"):
+                        rf = float(line.split()[1])    # kB, file-backed
+                    elif line.startswith("RssAnon:"):
+                        ra = float(line.split()[1])    # kB, anonymous
+                if rf is not None or ra is not None:
+                    mi["rss"] = (rf or 0.0) + (ra or 0.0)
+        except (OSError, ValueError):
+            pass
+    _MEMINFO["info"], _MEMINFO["at"], _MEMINFO["pid"] = mi, now, pid
+    return mi
+
+
+
+def fetch_slots(port):
+    txt = http_get("http://127.0.0.1:%d/slots" % port, timeout=3, tries=1)
+    if not txt:
+        return None
+    try:
+        j = json.loads(txt)
+        return j if isinstance(j, list) else None
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+# ==================== suzu/fetch/gpu.py
+"""GPU rows: nvidia-smi first, rocm-smi fallback."""
+
+
+
+_GPU_SMI = {"at": 0.0, "rows": None}
+
+
+
+def fetch_gpu():
+    """One row per GPU: util %, VRAM used/total, watts, degC, SM clock.
+    Cached 2 s - the panel ticks faster than a GPU counter meaningfully moves,
+    and nvidia-smi is not free (it spawns a process).
+    Tries nvidia-smi first; falls back to rocm-smi (AMD ROCm) when nvidia-smi
+    is absent or returns no rows."""
+    now = time.time()
+    if _GPU_SMI["rows"] is not None and now - _GPU_SMI["at"] < 2.0:
+        return _GPU_SMI["rows"]
+    rows = None
+    try:
+        rows = []
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,",
+             "memory.total,power.draw,temperature.gpu,clocks.sm",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=3).stdout
+        def _f(s):
+            try:
+                return float(s)
+            except ValueError:
+                return None
+        for line in out.splitlines():
+            p = [x.strip() for x in line.split(",")]
+            if len(p) < 6:
+                continue
+            rows.append({"util": _f(p[0]), "mem": _f(p[1]), "memtot": _f(p[2]),
+                         "w": _f(p[3]), "c": _f(p[4]), "mhz": _f(p[5])})
+        if not rows:
+            rows = _fetch_rocm_gpu()
+    except (OSError, subprocess.SubprocessError, ValueError):
+        rows = _fetch_rocm_gpu()
+    if rows:
+        _GPU_SMI["rows"], _GPU_SMI["at"] = rows, now
+        return rows
+    return None
+
+
+
+def _fetch_rocm_gpu():
+    """AMD ROCm fallback via rocm-smi. `rocm-smi --csv` is not supported on this
+    build ("NOT_SUPPORTED: Cannot print JSON/CSV output"), so parse the supported
+    tabular (concise) output instead. Per device data row, after the
+    (Device, Node, DID, GUID, Temp, Power, Mem, Compute, PartID) prefix the
+    tokens are: SCLK, MCLK, Fan, Perf, PwrCap, VRAM%, GPU%. rocm-smi reports VRAM
+    as a percent only, so absolute used/total (MB) comes from /sys/class/drm; the
+    two enumerations are ordered differently, so each device is matched to the card
+    whose used/total ratio is closest to its reported VRAM%. Returns rows in the
+    same shape as the nvidia-smi parser (util, mem, memtot, w, c, mhz)."""
+    try:
+        out = subprocess.run(["/opt/rocm/bin/rocm-smi"],
+                             capture_output=True, text=True, timeout=3).stdout
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+    def _num(tok):
+        try:
+            s = "".join(ch for ch in str(tok) if ch.isdigit() or ch in ".-")
+            return float(s) if s else None
+        except (ValueError, TypeError):
+            return None
+
+    cards = []
+    try:
+        import glob
+        for path in sorted(glob.glob("/sys/class/drm/card*/device/mem_info_vram_total")):
+            try:
+                tot = int(open(path).read().strip()) / 1024.0
+            except (OSError, ValueError, AttributeError):
+                continue
+            used = None
+            try:
+                used = int(open(path.replace("_total", "_used")).read().strip()) / 1024.0
+            except (OSError, ValueError, AttributeError):
+                pass
+            ratio = (used / tot) if (used is not None and tot) else None
+            cards.append({"tot": tot, "used": used, "ratio": ratio, "taken": False})
+    except Exception:
+        cards = []
+
+    dev_rows = []
+    for line in out.splitlines():
+        toks = line.split()
+        if not toks or not toks[0].isdigit():
+            continue
+        try:
+            dev = int(toks[0])
+        except ValueError:
+            continue
+        tpos = None
+        for k, tk in enumerate(toks):
+            if "\u00b0" in tk or tk.endswith("C"):
+                tpos = k
+                break
+        if tpos is None or tpos + 11 >= len(toks):
+            continue
+        gpu_pct = _num(toks[tpos + 11])
+        vram_pct = _num(toks[tpos + 10])
+        if gpu_pct is None:
+            continue
+        mclk = _num(toks[tpos + 6])
+        sclk = _num(toks[tpos + 5])
+        dev_rows.append({
+            # util is a PERCENT number (0-100) to match the nvidia-smi parser
+            # (fetch_gpu stores the raw nvidia-smi utilization.gpu value, which
+            # is 0-100). gpu_cols() and line ~3170 both divide by 100.0 for a
+            # 0-1 gauge, and print util as "%.0f%" - so storing a 0-1 fraction
+            # here made the gauge read u/100 = 0.003x (empty) and the label
+            # print 0.03 -> "0%". This was why suzu showed 0-1% while rocm-smi
+            # swung 0->100%.
+            "util": gpu_pct,
+            "c": _num(toks[tpos]),
+            "w": _num(toks[tpos + 1]),
+            "mhz": (mclk if mclk is not None else sclk),
+            "mem": None,
+            "memtot": None,
+            "vram_pct": vram_pct,
+            "dev": dev,
+        })
+
+    rows = []
+    for dr in dev_rows:
+        best, best_d = None, float("inf")
+        if dr["vram_pct"] is not None:
+            for card in cards:
+                if card["taken"] or card["ratio"] is None:
+                    continue
+                d = abs(card["ratio"] - dr["vram_pct"] / 100.0)
+                if d < best_d:
+                    best, best_d = card, d
+        if best is not None and best_d <= 0.15:
+            best["taken"] = True
+            dr["mem"] = best["used"]
+            dr["memtot"] = best["tot"]
+        del dr["vram_pct"]
+        del dr["dev"]
+        rows.append(dr)
+    return rows or None
+
+# ==================== suzu/fetch/info.py
+"""Model/server introspection: config.json, cmdline, arch map."""
+
+
+
+def server_info(port):
+    """Draft model, spec type, k and uptime from the process holding the port.
+    tmux and earlyoom lines are skipped: tmux carries an identical command line
+    (it is the wrapper) and earlyoom embeds 'llama-server' in its --prefer regex."""
+    info = {"draft": None, "spec": None, "k": None, "up": None, "model": None,
+            "engine": None}
+    try:
+        # -ww IS MANDATORY: without it ps truncates args= to $COLUMNS, and this
+        # panel sets COLUMNS itself for layout, so "--port N" fell off the end
+        # and the header silently lost the draft model and the uptime.
+        out = subprocess.run(["ps", "-ww", "-eo", "pid=,etimes=,args="],
+                             capture_output=True, text=True, timeout=4).stdout
+    except (OSError, subprocess.SubprocessError) as e:
+        if os.environ.get("SUZU_DEBUG"):
+            sys.stderr.write("suzu: ps failed: %r\n" % (e,))
+        return info
+    portpat = re.compile(r"(?:--port[= ]\s*|-p\s+)%d(?!\d)" % port)
+    best = fallback = None
+    for line in out.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) < 3:
+            continue
+        args = parts[2]
+        base = os.path.basename(args.split(None, 1)[0])
+        if base in ("tmux", "earlyoom", "sh", "bash", "grep"):
+            continue
+        if not any(b in base for b in ("llama-server", "ds4-server", "vllm", "python")):
+            continue
+        # "python" also matches the gateway and this very monitor: neither is an
+        # engine, and picking one would report ITS uptime as the model's. Exclude
+        # suzu by SCRIPT NAME, not path substring - the demo engine lives under a
+        # .../suzu/ directory and must still match - plus the gateway if
+        # --lanes-url points at one.
+        try:
+            script = os.path.basename(args.split(None, 1)[1].split()[0])
+        except IndexError:
+            script = ""
+        if script == "suzu.py" or (config.LANES_URL and _lanes_host() in args):
+            continue
+        if portpat.search(args):
+            best = (parts, args, base)
+            break
+        # The panel normally polls :30001, which is the GATEWAY - the engine
+        # itself listens on :30021 and its cmdline never carries the polled port,
+        # so the strict match found nothing and the header lost the draft model
+        # AND the uptime ("(no draft model)", "--:--", seen 23-08 with a dspark
+        # drafter plainly running). The launcher guarantees one engine at a time, so an
+        # engine process with the wrong port is still THE engine.
+        if fallback is None and any(
+                x in args for x in ("llama-server", "ds4-server", "vllm", "sglang", "tensorfold serve")):
+            fallback = (parts, args, base)
+        # TabbyAPI presents itself as `venv/bin/python .../tabby/main.py --config X`:
+        # none of the markers above. Without this branch the glm53x entry's header
+        # stayed without engine name and without uptime.
+        if fallback is None and "main.py" in args and "tabby" in args:
+            fallback = (parts, args, base)
+    if not best:
+        best = fallback
+    if not best:
+        if os.environ.get("SUZU_DEBUG"):
+            sys.stderr.write("suzu: no process on port %d among %d ps lines\n"
+                             % (port, len(out.splitlines())))
+        return info
+    parts, args, base = best
+    try:
+        info["up"] = int(parts[1])
+    except ValueError:
+        pass
+    info["pid"] = parts[0]
+    info["engine"] = base
+    # `python -m vllm.entrypoints...` is not a useful name in the header.
+    for nice in ("llama-server", "ds4-server", "vllm", "sglang"):
+        if nice in args:
+            info["engine"] = nice
+            break
+    if "tensorfold serve" in args:
+        # rank 0 of the TP=2 engine (glm53tf): inside the container, visible from the host's ps
+        info["engine"] = "tensorfold"
+        m = re.search(r"--drafter[= ]\s*(\S+)", args)
+        m_drafter = bool(m) and m.group(1) != "none"
+        if m:
+            d = re.search(r"models--([^/]+)--([^/]+)/snapshots/([0-9a-f]{7})", m.group(1))
+            info["draft"] = "%s/%s@%s" % d.groups() if d else os.path.basename(m.group(1).rstrip("/"))
+            info["spec"] = "DFlash2 + MTP + lookup, depth by cost"
+        else:
+            info["spec"] = "MTP, depth by cost"
+        for flag, key in (("--context", "maxlen"), ("--name", "model"), ("--tp", "tp")):
+            m = re.search(re.escape(flag) + r"[= ]\s*(\S+)", args)
+            if m:
+                info[key] = m.group(1)
+        if info.get("tp") == "2":
+            info["nnodes"] = "2"          # the two ranks live on this box and the rank-1 box
+        env = tf_env()
+        info["k"] = env.get("GLM53_TF_AUTO_FDRAFTS") or info["k"]
+        info["slots"] = env.get("GLM53_TF_BATCH")
+        info["kvdtype"] = env.get("GLM53_TF_KV_DTYPE")
+        info["quant"] = "EXL3 4bpw + q4 non-expert" if env.get("GLM53_TF_NONEXPERT") == "q4mse" else None
+        if "TF_GLM_DFLASH_POLICY" in env:                 # newer kit: other knobs, other names
+            pol = env["TF_GLM_DFLASH_POLICY"]
+            m = re.match(r"f\D*(\d+)", pol)
+            info["k"] = m.group(1) if m else info["k"]
+            copy = env.get("TF_GLM_COPY_DRAFTS") == "1"
+            info["spec"] = ("DFlash2 %s + copy drafts (up to %s)" % (pol, env.get("TF_GLM_COPY_MAX", "?")) if copy
+                            else "DFlash2 %s" % pol) if m_drafter else "MTP"
+            m = re.search(r"--parallel[= ]\s*(\d+)", args)
+            info["slots"] = m.group(1) if m else info["slots"]
+            info["kvdtype"] = env.get("TF_GLM_KV") or info["kvdtype"]
+            dense = env.get("TF_GLM_DENSE")
+            info["quant"] = "EXL3 4bpw + %s dense" % dense if dense else info["quant"]
+        return info
+    if "main.py" in args and "tabby" in args:
+        info["engine"] = "tabby/exl3"
+        # without the environment the header does not even know whether MTP is on
+        env = proc_env(parts[0])
+        info["spec"] = env.get("TABBY_DRAFT_MODEL_DRAFT_MODE") or info["spec"]
+        if info["spec"] and info["spec"] != "disabled":
+            info["draft"] = info["draft"] or "native MTP of the pack"
+        cache = env.get("TABBY_MODEL_CACHE_MODE")
+        if cache:
+            info["engine"] += " . cache " + cache
+    for flag, key in (("--spec-draft-model", "draft"), ("--spec-type", "spec"),
+                      ("--spec-draft-n-max", "k"), ("--model", "model"),
+                      ("--served-model-name", "model"),
+                      ("--quantization", "quant"), ("--kv-cache-dtype", "kvdtype"),
+                      ("--tensor-parallel-size", "tp"), ("--nnodes", "nnodes"),
+                      ("--max-num-seqs", "seqs"), ("--max-model-len", "maxlen")):
+        if info.get(key):
+            continue
+        m = re.search(re.escape(flag) + r"[= ]\s*(\S+)", args)
+        if m:
+            info[key] = m.group(1)
+    # vLLM does not take the llama.cpp flags: the whole speculative stack arrives
+    # as one JSON blob, so without this the panel says "no draft model" while
+    # dspark is demonstrably drafting (spec_decode_* counters moving).
+    m = re.search(r"--speculative[-_]config[= ]\s*(\{.*?\})(?:\s+--|\s*$)", args)
+    if m:
+        try:
+            sc = json.loads(m.group(1))
+        except (json.JSONDecodeError, ValueError):
+            sc = {}
+        if isinstance(sc, dict):
+            info["draft"] = info["draft"] or sc.get("model")
+            info["spec"] = info["spec"] or sc.get("method")
+            k = sc.get("num_speculative_tokens")
+            info["k"] = info["k"] or (str(k) if k is not None else None)
+    return info
+
+
+
+def model_config_path():
+    """Host path to the running engine's model config.json.
+
+    The layer grid is built from the REAL model topology (num layers, experts,
+    DSpark target layers, KV compression ratios) - not a hard-coded table. The
+    engine is a docker container; the config lives in the /models mount. Falls
+    back to scanning ~/models for the most recent tp1/config.json.
+    """
+    try:
+        names = subprocess.run(["docker", "ps", "--format", "{{.Names}}"],
+                               capture_output=True, text=True, timeout=8).stdout.split()
+        # TensorFold (glm53mia, glm53tf: 05-10): `tensorfold serve <model folder>` inside the container, the folder
+        # under the HF cache mount. Without this the expert heat map had no topology on TensorFold and vanished
+        # once the old tp1/ folders of the vLLM kit were gone from ~/models.
+        for n in names:
+            try:
+                out = subprocess.run(["docker", "inspect", "-f", "{{json .Config.Cmd}}\t{{json .Mounts}}", n],
+                                     capture_output=True, text=True, timeout=8).stdout
+                cmd_j, mounts_j = out.rstrip("\n").split("\t", 1)
+                cmd, mounts = json.loads(cmd_j) or [], json.loads(mounts_j) or []
+            except (ValueError, OSError, subprocess.SubprocessError):
+                continue
+            if "serve" not in cmd or not any("tensorfold" in str(c) for c in cmd[:2]):
+                continue
+            model = cmd[cmd.index("serve") + 1] if cmd.index("serve") + 1 < len(cmd) else ""
+            for mnt in mounts:
+                dst = (mnt.get("Destination") or "").rstrip("/")
+                if dst and model.startswith(dst + "/"):
+                    p = os.path.join(mnt.get("Source") or "", model[len(dst) + 1:], "config.json")
+                    if os.path.exists(p):
+                        return p
+        for n in names:
+            if not any(t in n for t in ("vllm", "spark", "sglang")):
+                continue
+            mounts = subprocess.run(
+                ["docker", "inspect", "-f",
+                 "{{range .Mounts}}{{.Source}}|{{.Destination}} {{end}}", n],
+                capture_output=True, text=True, timeout=8).stdout
+            for part in mounts.split():
+                if "|" not in part:
+                    continue
+                src, dst = part.split("|", 1)
+                dst = dst.rstrip("/")
+                if dst == "/models":
+                    p = os.path.join(src, "tp1", "config.json")
+                    if os.path.exists(p):
+                        return p
+    except (OSError, subprocess.SubprocessError):
+        pass
+    # fallback: the most recent tp1 config in ~/models
+    cands = []
+    mdir = os.path.expanduser("~/models")
+    try:
+        for root, dirs, files in os.walk(mdir):
+            if root.endswith(os.sep + "tp1") and "config.json" in files:
+                cands.append(os.path.join(root, "config.json"))
+    except OSError:
+        pass
+    return max(cands, key=os.path.getmtime) if cands else None
+
+
+
+def load_model_arch(path):
+    """Extract the per-layer topology from a model config.json.
+
+    Returns None on any failure; the layer grid degrades to a message instead
+    of a crash. Everything here is static model structure - the LIVE work
+    colours come from the Sample, never from this table.
+    """
+    try:
+        with open(path) as f:
+            c = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if isinstance(c.get("text_config"), dict):      # GLM-5.3 (glm5_next): the text model's fields live here
+        top, c = c, dict(c["text_config"])
+        if not c.get("vision_n_layers"):
+            c["vision_n_layers"] = (top.get("vision_config") or {}).get("depth") or 0
+        kinds = c.get("mlp_layer_types") or []
+        if kinds and not c.get("hybrid_tr3_tail"):
+            c["hybrid_tr3_tail"] = {"moe_layers": [i for i, k in enumerate(kinds) if k == "sparse"]}
+    n = int(c.get("num_hidden_layers") or 0)
+    if n <= 0:
+        return None
+    comp = c.get("compress_ratios") or []
+    comp = {i: int(v) for i, v in enumerate(comp)}
+    return {
+        "n": n,
+        "experts": int(c.get("n_routed_experts") or 0),
+        "topk": int(c.get("num_experts_per_tok") or 0),
+        "shared": int(c.get("n_shared_experts") or 0),
+        "nextn": int(c.get("num_nextn_predict_layers") or 0),
+        "vision": int(c.get("vision_n_layers") or 0),
+        "target": [int(x) for x in (c.get("dspark_target_layer_ids") or [])],
+        "compress": comp,
+        "moe_layers": (c.get("hybrid_tr3_tail") or {}).get("moe_layers"),
+        "name": os.path.basename(os.path.dirname(os.path.dirname(path))),
+    }
+
+# ==================== suzu/fetch/logtail.py
+"""Engine log discovery and tail."""
+
+
+
+def active_log(llm):
+    try:
+        out = subprocess.run(["tmux", "list-sessions", "-F", "#{session_name}"],
+                             capture_output=True, text=True, timeout=3).stdout
+    except (OSError, subprocess.SubprocessError):
+        out = ""
+    cands = []
+    for s in (x for x in out.split() if x.startswith("yz-")):
+        p = os.path.join(llm, "yz-logs", "yz-%s.log" % s[3:])
+        if os.path.exists(p):
+            cands.append(p)
+    if not cands:
+        d = os.path.join(llm, "yz-logs")
+        if os.path.isdir(d):
+            cands = [os.path.join(d, f) for f in os.listdir(d) if f.endswith(".log")]
+    return max(cands, key=os.path.getmtime) if cands else None
+
+
+
+def log_mtime(llm):
+    """Wall-clock of the server's last log write. Used only to seed the idle
+    clock: a panel started five minutes ago must not claim the engine has been
+    idle for five minutes when the log says it has been quiet since 06:57."""
+    lp = active_log(llm)
+    try:
+        return os.path.getmtime(lp) if lp else None
+    except OSError:
+        return None
+
+
+
+def tail(path, n):
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size, data = f.tell(), b""
+            while size > 0 and data.count(b"\n") <= n + 2:
+                step = min(8192, size)
+                size -= step
+                f.seek(size)
+                data = f.read(step) + data
+        return [ANSI_RE.sub("", l).rstrip() for l in
+                data.decode("utf-8", "replace").splitlines()[-n:]]
+    except OSError:
+        return []
+
+# ==================== suzu/fetch/vllm.py
+"""vLLM-specific synthesis: pool gauges, ctx max, synthetic slots."""
+
+
+
+_VLLM_POOL = {}
+
+
+
+_VLLM_CTXMAX = {}
+
+
+
+def vllm_pool(port):
+    """KV pool size in tokens, from the boot log ("GPU KV cache size: N tokens").
+
+    Not derivable from /metrics: `vllm:cache_config_info` reports num_gpu_blocks
+    12355 x block_size 4 = 49,420 on a real pool of 2,192,815 (measured 21-08),
+    because the hybrid cache (128-token sliding-window layers beside the global
+    ones) is not that product. `docker logs` costs ~10 s: memoized on container
+    id + StartedAt, so a restart invalidates the cache by itself.
+    """
+    if port in _VLLM_POOL:
+        return _VLLM_POOL[port]
+    _VLLM_POOL[port] = None
+    try:
+        names = subprocess.run(["docker", "ps", "--format", "{{.Names}}"],
+                               capture_output=True, text=True, timeout=8).stdout.split()
+        name = next((x for x in names
+                     if any(t in x for t in ("vllm", "spark", "sglang"))), None)
+        if not name:
+            return None
+        key = subprocess.run(["docker", "inspect", "-f", "{{.Id}}-{{.State.StartedAt}}", name],
+                             capture_output=True, text=True, timeout=8).stdout.strip()
+        cache = "/tmp/yz-kvpool-" + re.sub(r"[^A-Za-z0-9]", "", key)[:40] if key else None
+        if cache and os.path.exists(cache):
+            _VLLM_POOL[port] = int(open(cache).read().strip())
+            return _VLLM_POOL[port]
+        log = subprocess.run(["docker", "logs", "--tail", "4000", name],
+                             capture_output=True, text=True, timeout=40)
+        hits = re.findall(r"GPU KV cache size: ([\d,]+) tokens", log.stdout + log.stderr)
+        if hits:
+            _VLLM_POOL[port] = int(hits[-1].replace(",", ""))
+            if cache:
+                open(cache, "w").write(str(_VLLM_POOL[port]))
+    except Exception:
+        pass
+    return _VLLM_POOL[port]
+
+
+
+def vllm_ctxmax(port):
+    """max_model_len from /v1/models: on vLLM there is no llamacpp:n_tokens_max."""
+    if port in _VLLM_CTXMAX:
+        return _VLLM_CTXMAX[port]
+    _VLLM_CTXMAX[port] = 0
+    txt = http_get("http://127.0.0.1:%d/v1/models" % port, timeout=4, tries=1)
+    if txt:
+        try:
+            _VLLM_CTXMAX[port] = int(json.loads(txt)["data"][0].get("max_model_len") or 0)
+        except (ValueError, KeyError, IndexError, TypeError):
+            pass
+    return _VLLM_CTXMAX[port]
+
+
+
+def synth_slots_vllm(mx, port):
+    """Synthetic slot for vLLM, which does NOT expose /slots.
+
+    On llama.cpp the /metrics counters are flushed at request end, which is why
+    this monitor reads /slots. On vLLM it is the OPPOSITE, measured by sampling
+    every 2 s inside a single request (21-08 on dsflash):
+
+        t1 draft=530  acc=298 gen=400      <- not started yet
+        t3 draft=725  acc=395 gen=537
+        t6 draft=1035 acc=502 gen=706      <- still in flight
+
+    So it is enough to remap /metrics into the shape of a llama.cpp slot and the
+    whole TUI works without touching anything else. Two differences to keep in
+    mind:
+      - `n_decoded` here is a LIFETIME counter, not reset per request: deltas
+        stay >= 0, so the "negative delta = new task" branch never fires
+        (harmless).
+      - prefill is not visible on `vllm:prompt_tokens_total`, credited only at
+        request CLOSE (measured: 48 after killing a 900k prefill halfway). The
+        only reading that advances during a long prefill is
+        `kv_cache_usage_perc` -> progress is that fraction of the pool.
+    Without the pool (unreadable log) it returns 0 on ptok/n_ctx: the slot panel
+    switches itself off and the rest of the TUI stays valid.
+    """
+    if not any(k.startswith("vllm:") for k in mx):
+        return None
+    pool = vllm_pool(port) or 0
+    ptok = int(mx.get("vllm:kv_cache_usage_perc", 0.0) * pool)
+    q = mx.get("vllm:prefix_cache_queries_total", 0.0)
+    h = mx.get("vllm:prefix_cache_hits_total", 0.0)
+    return [{
+        "next_token": {"n_decoded": int(mx.get("vllm:generation_tokens_total", 0.0))},
+        "n_prompt_tokens_processed": ptok,
+        "n_prompt_tokens": ptok,
+        "n_prompt_tokens_cache": int(ptok * h / q) if q > 0 else 0,
+        "n_ctx": int(pool),
+        "is_processing": mx.get("vllm:num_requests_running", 0.0) > 0,
+    }]
+
+# ==================== suzu/fetch/engine.py
+"""Engine sample model and the llama.cpp/vLLM live probes."""
+
 
 
 class Sample:
@@ -598,6 +1300,7 @@ class Sample:
                 or self.acc < prev.acc - 1)
 
 
+
 def fetch_yzq(port):
     """Queue depth from the optional gateway in front of the engine, if the
     polled port IS the gateway.
@@ -621,6 +1324,7 @@ def fetch_yzq(port):
     return j if isinstance(j, dict) and "high" in j else None
 
 
+
 def yzq_live_sse(yzq):
     """SSE events relayed so far for EVERY request still open at the gateway. Its `inflight` is only the first job: with
     two lanes the other one's tokens were missing from the live estimate and landed all at once when it closed (30-09,
@@ -630,6 +1334,7 @@ def yzq_live_sse(yzq):
     if jobs:
         return sum(int(j.get("sse") or 0) for j in jobs)
     return int((q.get("inflight") or {}).get("sse") or 0)
+
 
 
 def fetch_yzq_lanes(port, url=None):
@@ -647,41 +1352,688 @@ def fetch_yzq_lanes(port, url=None):
         return None
     return j if isinstance(j, dict) else None
 
+# ==================== suzu/fetch/tabby.py
+"""TabbyAPI / exllamav3 adapter: /props + gateway + engine log."""
 
-_GPU_SMI = {"at": 0.0, "rows": None}
 
 
-def fetch_gpu():
-    """One row per GPU: util %, VRAM used/total, watts, degC, SM clock.
-    Cached 2 s - the panel ticks faster than a GPU counter meaningfully moves,
-    and nvidia-smi is not free (it spawns a process)."""
-    now = time.time()
-    if _GPU_SMI["rows"] is not None and now - _GPU_SMI["at"] < 2.0:
-        return _GPU_SMI["rows"]
+_TABBY_PROPS = {}
+
+
+
+_TAB_ZERO = {"gen": 0, "new": 0, "ps": 0.0, "acc": 0, "draft": 0, "n": 0}
+
+
+
+_TABBY_LOG = {"path": None, "off": 0, "carry": None, "tot": dict(_TAB_ZERO),
+              "last": None}
+
+
+
+_TABBY_MONO = {"gen": 0.0}
+
+
+
+_TABBY_KFILE = "/tmp/yz-tabby-k"
+
+
+
+def _tabby_k0():
+    """Last calibrated factor, saved by a previous panel run. Without it the
+    FIRST request after each engine start would read at a third of truth."""
     try:
-        out = subprocess.run(
-            ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,"
-             "memory.total,power.draw,temperature.gpu,clocks.sm",
-             "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=3).stdout
-        rows = []
+        k = float(open(_TABBY_KFILE).read().strip())
+        return k if 0.5 <= k <= 12.0 else 0.0
+    except (OSError, ValueError):
+        return 0.0
 
-        def _f(s):
-            try:
-                return float(s)
-            except ValueError:
-                return None
-        for line in out.splitlines():
-            p = [x.strip() for x in line.split(",")]
-            if len(p) < 6:
-                continue
-            rows.append({"util": _f(p[0]), "mem": _f(p[1]), "memtot": _f(p[2]),
-                         "w": _f(p[3]), "c": _f(p[4]), "mhz": _f(p[5])})
-        if rows:
-            _GPU_SMI["rows"], _GPU_SMI["at"] = rows, now
-        return rows or None
-    except (OSError, subprocess.SubprocessError, ValueError):
+
+
+_TABBY_RATIO = {"gen": 0.0, "ev": 0.0, "p_gen": None, "p_ev": None, "p_n": None,
+                "saved": _tabby_k0()}
+
+
+
+_TS_RE = re.compile(r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d")
+
+
+
+_TAB_GEN = re.compile(r"(\d+) tokens generated in\s+([\d.]+) seconds")
+
+
+
+_TAB_Q = re.compile(r"Queue:\s+([\d.]+) s")
+
+
+
+_TAB_P = re.compile(r"Process:\s+(\d+) cached tokens and\s+(\d+) new tokens at\s+([\d.]+) T/s")
+
+
+
+_TAB_G = re.compile(r"Generate:\s+([\d.]+) T/s")
+
+
+
+_TAB_C = re.compile(r"Context:\s+(\d+) tokens")
+
+
+
+_TAB_D = re.compile(r"Draft:\s+(\d+) / (\d+) tokens accepted")
+
+
+
+def proc_env(pid):
+    """A process environment. TabbyAPI's knobs live THERE, not on the command
+    line: the config file deliberately stays silent on the dynamic keys and
+    the launcher passes them as TABBY_* (with --config X the other flags are
+    ignored, tabby_config.py:141)."""
+    env = {}
+    try:
+        with open("/proc/%s/environ" % pid, "rb") as f:
+            for kv in f.read().split(b"\0"):
+                if b"=" in kv:
+                    a, _, b = kv.partition(b"=")
+                    env[a.decode("utf-8", "replace")] = b.decode("utf-8", "replace")
+    except OSError:
+        pass
+    return env
+
+
+
+def tabby_env():
+    """TabbyAPI's process environment, or {}. The tmux line is skipped: it is
+    the wrapper and carries the same command line."""
+    try:
+        out = subprocess.run(["ps", "-ww", "-eo", "pid=,args="],
+                             capture_output=True, text=True, timeout=4).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    for line in out.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) < 2:
+            continue
+        args = parts[1]
+        if "main.py" not in args or "tabby" not in args:
+            continue
+        if os.path.basename(args.split(None, 1)[0]) in ("tmux", "sh", "bash"):
+            continue
+        env = proc_env(parts[0])
+        if env:
+            return env
+    return {}
+
+
+
+def tabby_props(port):
+    """n_ctx and slots. Memoized ONLY on success: during the load (30-40 s at
+    512k) /props does not answer, and memoizing the hole would have switched the
+    tabby branch off for the whole life of the panel.
+
+    ⚠ /props is not reliable as a PRESENCE probe. Measured 29-08: under a long
+    prefill TabbyAPI stays mute for up to 20 s, and a panel that concludes "no
+    engine" at that moment switches off EXACTLY when the engine works — which is
+    the defect this file exists for. So if /props stays silent it falls back to
+    the process environment, where the launcher already wrote
+    TABBY_MODEL_MAX_SEQ_LEN: not an estimate, it is the same number the server
+    received at startup.
+    """
+    if _TABBY_PROPS.get(port):
+        return _TABBY_PROPS[port]
+    n, slots = 0, 0
+    txt = http_get("http://127.0.0.1:%d/props" % port, timeout=6, tries=2)
+    if txt:
+        try:
+            j = json.loads(txt)
+            n = int((j.get("default_generation_settings") or {}).get("n_ctx") or 0)
+            slots = int(j.get("total_slots") or 0)
+        except (ValueError, TypeError, AttributeError):
+            n = 0
+    if n <= 0:
+        try:
+            n = int(tabby_env().get("TABBY_MODEL_MAX_SEQ_LEN") or 0)
+        except (ValueError, TypeError):
+            n = 0
+    if n <= 0:
+        return {}
+    _TABBY_PROPS[port] = {"n_ctx": n, "slots": slots or 1}
+    return _TABBY_PROPS[port]
+
+
+
+def tabby_parse(rec):
+    """A gathered `Metrics (ID: ...)` record -> dict, or None if it is not one."""
+    rec = re.sub(r"\s+", " ", rec)
+    mg, mp = _TAB_GEN.search(rec), _TAB_P.search(rec)
+    if not mg or not mp:
         return None
+    mq, mgg, mc, md = (_TAB_Q.search(rec), _TAB_G.search(rec),
+                       _TAB_C.search(rec), _TAB_D.search(rec))
+    return {
+        "gen": int(mg.group(1)), "sec": float(mg.group(2)),
+        "queue": float(mq.group(1)) if mq else 0.0,
+        "cached": int(mp.group(1)), "new": int(mp.group(2)),
+        "ptps": float(mp.group(3)),
+        "gtps": float(mgg.group(1)) if mgg else 0.0,
+        "ctx": int(mc.group(1)) if mc else 0,
+        "acc": int(md.group(1)) if md else 0,
+        "draft": int(md.group(2)) if md else 0,
+    }
+
+
+
+def tabby_scan(path, maxbytes=262144):
+    """(cumulative totals, last record) from the `Metrics (ID: ...)` lines.
+
+    ⚠ The log is written by rich WITHOUT a tty: the console falls back to 80
+    columns and EVERY record comes out split over 3-4 lines, sometimes in the
+    middle of a field ("Queue:" / "0.01 s"). Continuation lines carry no
+    timestamp, and that is how they are recognised; they are rejoined and the
+    spaces normalized before reading the numbers. (From today the glm53x entry
+    launches with TABBY_LOG_CONSOLE_WIDTH: NEW logs sit on a single line, the
+    unwrap is for the ones already written and for a hand-started engine.)
+
+    ⚠ The totals are ACCUMULATED, not recomputed over the file tail. It seemed
+    simpler to re-sum the last 256 KB at every tick, but that window SLIDES: as
+    soon as the log outgrows it the cumulatives DROP, and a drop here is
+    exactly what Sample.restarted_from reads as "engine restarted" -> panel
+    history thrown away every few minutes. So only the NEW tail is read
+    (offset), and the window only decides where to start the first time. A real
+    restart (different file, or shorter than before) deliberately zeroes
+    everything.
+    """
+    st = _TABBY_LOG
+    if not path:
+        return dict(st["tot"]), st["last"]
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return dict(st["tot"]), st["last"]
+    if st["path"] != path or size < st["off"]:
+        # First read or rotated log. Start from the tail: the rest of the file
+        # is another engine session's history. The cut falls in the middle of
+        # a line, which lacking the timestamp discards itself.
+        st.update(path=path, off=max(0, size - maxbytes), carry=None,
+                  tot=dict(_TAB_ZERO), last=None)
+        _TABBY_MONO["gen"] = 0.0
+        _TABBY_PROPS.clear()             # new engine = re-read n_ctx
+    if size <= st["off"]:
+        return dict(st["tot"]), st["last"]
+    try:
+        with open(path, "rb") as f:
+            f.seek(st["off"])
+            data = f.read(size - st["off"])
+    except OSError:
+        return dict(st["tot"]), st["last"]
+    cut = data.rfind(b"\n")              # the half line is read on the next round
+    if cut < 0:
+        return dict(st["tot"]), st["last"]
+    st["off"] += cut + 1
+    buf, tot = st["carry"], st["tot"]
+    for ln in ANSI_RE.sub("", data[:cut].decode("utf-8", "replace")).splitlines():
+        if _TS_RE.match(ln):
+            if buf is not None:
+                rec = tabby_parse(buf)
+                if rec:
+                    tot["gen"] += rec["gen"]
+                    tot["new"] += rec["new"]
+                    tot["acc"] += rec["acc"]
+                    tot["draft"] += rec["draft"]
+                    tot["n"] += 1
+                    if rec["ptps"] > 0:
+                        tot["ps"] += rec["new"] / rec["ptps"]
+                    st["last"] = rec
+                buf = None
+            if "Metrics (ID:" in ln:
+                buf = ln
+        elif buf is not None:
+            buf += " " + ln.strip()
+    st["carry"] = buf                    # record still open: it closes next round
+    return dict(tot), st["last"]
+
+
+
+def tabby_scale(tot, ev_total, ev_live):
+    """In-flight SSE events -> tokens, using the factor calibrated on closed
+    records.
+
+    The baseline (p_gen, p_ev) moves ONLY when a record closes (tot["n"]
+    grows): that way the two deltas cover the same set of requests. If it
+    were updated every tick, the piece still in flight — events counted,
+    tokens not yet written to the log — would drag the ratio down
+    continuously.
+    """
+    r = _TABBY_RATIO
+    if r["p_ev"] is None or ev_total < r["p_ev"] or tot["gen"] < (r["p_gen"] or 0):
+        # first round, or gateway/engine restarted: restart from the current base
+        r.update(gen=0.0, ev=0.0, p_gen=float(tot["gen"]), p_ev=ev_total,
+                 p_n=tot["n"])
+    elif r["p_n"] is not None and tot["n"] > r["p_n"]:
+        r["gen"] += float(tot["gen"]) - r["p_gen"]
+        r["ev"] += ev_total - r["p_ev"]
+        r["p_gen"], r["p_ev"], r["p_n"] = float(tot["gen"]), ev_total, tot["n"]
+    if r["ev"] >= 20 and r["gen"] > 0:
+        k = r["gen"] / r["ev"]
+        if abs(k - r["saved"]) > 0.05:
+            r["saved"] = k
+            try:                          # so the next panel starts calibrated
+                with open(_TABBY_KFILE, "w") as f:
+                    f.write("%.4f" % k)
+            except OSError:
+                pass
+    else:
+        k = r["saved"] or 1.0
+    return ev_live * k
+
+
+
+def synth_tabby(port, llm, yzq):
+    """(mx, slots) in llama.cpp shape for TabbyAPI. (None, None) if absent.
+
+    The only counter that advances WITHIN the request is the gateway's, and for
+    that reason it plays `tokens_predicted_total`: the log records arrive after
+    the fact. The two are summed (closed + in flight) and the sum is made
+    monotone by hand, because in the instant between "the client hangs up" and
+    "TabbyAPI writes the record" the in-flight piece disappears and a drop
+    would be read as an engine restart, wiping the whole panel history.
+    """
+    props = tabby_props(port)
+    if not props:
+        return None, None
+    tot, last = tabby_scan(active_log(llm))
+    inf = (yzq or {}).get("inflight") or {}
+    live_tok = tabby_scale(tot, float((yzq or {}).get("sse_total") or 0.0), yzq_live_sse(yzq))
+    gen = float(tot["gen"] + live_tok)
+    if gen < _TABBY_MONO["gen"]:
+        gen = _TABBY_MONO["gen"]
+    else:
+        _TABBY_MONO["gen"] = gen
+    pp, ps, acc, dra = float(tot["new"]), tot["ps"], tot["acc"], tot["draft"]
+    mx = {
+        "tabby:records": float(tot["n"]),
+        "llamacpp:tokens_predicted_total": gen,
+        "llamacpp:prompt_tokens_total": pp,
+        "llamacpp:prompt_seconds_total": ps,
+        "llamacpp:requests_processing": 1.0 if inf else 0.0,
+        "llamacpp:requests_deferred": float((yzq or {}).get("high") or 0)
+                                      + float((yzq or {}).get("low") or 0),
+        "llamacpp:n_tokens_max": float(props["n_ctx"]),
+    }
+    # The two speculative keys exist ONLY with MTP on: with draft_mode=disabled
+    # TabbyAPI writes no `Draft:` and the panel must say "No speculation", not
+    # 0% (which would mean "speculates and always gets it wrong").
+    if dra > 0:
+        mx["llamacpp:spec_decode_num_draft_tokens_total"] = float(dra)
+        mx["llamacpp:spec_decode_num_accepted_tokens_total"] = float(acc)
+    slots = [{
+        "next_token": {"n_decoded": live_tok},
+        # 0 ON PURPOSE: there is no prefill progress to sample here, and putting
+        # the last closed record's tokens there would read as "prefill done in
+        # one tick" -> spikes of thousands of t/s. With 0 the step() branch
+        # falls back to prompt_tokens/prompt_seconds, the true ratio because
+        # both come from the same records.
+        "n_prompt_tokens_processed": 0,
+        # ⚠ the denominator is NOT `Context:` alone. On an interrupted request
+        # (the gateway preempts the low lane) TabbyAPI logs a context smaller
+        # than the tokens it already had in cache, and the prefix bar reached
+        # 131% — measured 29-08. cached+new is what the engine really had in
+        # hand, so the ratio goes back under 1 without lying.
+        "n_prompt_tokens": max((last or {}).get("ctx") or 0,
+                               ((last or {}).get("cached") or 0)
+                               + ((last or {}).get("new") or 0)),
+        "n_prompt_tokens_cache": (last or {}).get("cached") or 0,
+        "n_ctx": props["n_ctx"],
+        "is_processing": bool(inf),
+    }]
+    return mx, slots
+
+# ==================== suzu/fetch/tensorfold.py
+"""TensorFold adapter: request log, gateway SSE, hermes usage db."""
+
+
+
+_TF_MONO = {"gen": 0.0, "comp": 0.0}
+
+
+
+_TF_LAST = {"key": None, "rec": None}
+
+
+
+def tf_last_record(path=config.TF_REQLOG):
+    """The last closed request of the request log, re-read only when the file changes."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    key = (st.st_mtime, st.st_size)
+    if _TF_LAST["key"] == key:
+        return _TF_LAST["rec"]
+    rec = None
+    try:
+        with open(path, "rb") as f:
+            f.seek(max(0, st.st_size - 65536))
+            for line in reversed(f.read().splitlines()):
+                try:
+                    rec = json.loads(line)
+                    break
+                except (ValueError, UnicodeDecodeError):
+                    continue
+    except OSError:
+        pass
+    _TF_LAST["key"], _TF_LAST["rec"] = key, rec
+    return rec
+
+
+
+_TF_ALL = {"ino": None, "off": 0, "carry": b"", "in": 0, "cached": 0, "out": 0, "n": 0, "since": None}
+
+
+
+def tf_lifetime(path=config.TF_REQLOG):
+    """Totals over the whole request log, across engine restarts (the /metrics counters restart at every boot).
+    Incremental: only the bytes appended since the last call are parsed, so the file can grow for months."""
+    a = _TF_ALL
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    if a["ino"] != st.st_ino or st.st_size < a["off"]:        # new file, or truncated: count again from zero
+        a.update(ino=st.st_ino, off=0, carry=b"", **{"in": 0}, cached=0, out=0, n=0, since=None)
+    if st.st_size > a["off"]:
+        try:
+            with open(path, "rb") as f:
+                f.seek(a["off"])
+                buf = a["carry"] + f.read()
+                a["off"] = f.tell()
+        except OSError:
+            return a
+        lines = buf.split(b"\n")
+        a["carry"] = lines.pop()                               # a half-written last line waits for the next call
+        for line in lines:
+            try:
+                r = json.loads(line)
+            except (ValueError, UnicodeDecodeError):
+                continue
+            a["in"] += int(r.get("prompt") or 0)
+            a["cached"] += int(r.get("cached") or 0)
+            a["out"] += int(r.get("decode_tokens") or 0)
+            a["n"] += 1
+            if a["since"] is None:
+                a["since"] = r.get("start") or r.get("ts")
+    return a
+
+
+
+_TF_DELTA = {"reqs": None, "prompt": 0.0, "cached": 0.0, "last": {}}
+
+
+
+def _lanes_host():
+    """Host[:port] of --lanes-url, so the ps filter can skip a gateway process
+    (it is not the engine and its uptime would be reported as the model's)."""
+    try:
+        from urllib.parse import urlsplit
+        netloc = urlsplit(config.LANES_URL or "").netloc
+        return netloc.split("@")[-1] if netloc else ""
+    except ValueError:
+        return ""
+
+
+
+_HERMES_USE = {"at": -1e9, "val": None}
+
+
+
+_HERMES_DAYS = {"at": -1e9, "val": None}
+
+
+
+def hermes_days(path=None, every=600.0):
+    """GENERATED tokens per day (local "YYYY-MM-DD" -> output_tokens) across all models, from the assistant's
+    session traffic. Usage is not recorded per call but per session x model, with a first and last instant: each row
+    is attributed to the days on which that session wrote messages inside its window, in proportion to how many;
+    with no messages in the window, to the day of the last one. 90% of rows live less than 2.2 hours (measured
+    01-10): almost always a single day. Messages are counted on the idx_messages_session_active index (0.2 s on
+    207k rows), every 10 min."""
+    now = time.time()
+    if now - _HERMES_DAYS["at"] < every:
+        return _HERMES_DAYS["val"]
+    _HERMES_DAYS["at"] = now
+    path = path or config.HERMES_DB
+    day = lambda ts: time.strftime("%Y-%m-%d", time.localtime(ts))
+    val = None
+    try:
+        import sqlite3
+        con = sqlite3.connect("file:%s?mode=ro" % path, uri=True, timeout=1.0)
+        try:
+            have = {r[0] for r in con.execute("select name from sqlite_master where type='table'")}
+            act = {}
+            if "messages" in have:
+                for sid, d, n in con.execute("select session_id, date(timestamp, 'unixepoch', 'localtime'), count(*) "
+                                             "from messages where timestamp is not null group by session_id, 2"):
+                    act.setdefault(sid, {})[d] = n
+            cols = "session_id, output_tokens, first_seen, last_seen"
+            parts = ["select %s from session_model_usage" % cols] if "session_model_usage" in have else []
+            if "session_model_usage_v21" in have:
+                parts.append("select %s from session_model_usage_v21%s" % (cols, (
+                    " where session_id not in (select session_id from session_model_usage)" if parts else "")))
+            out = {}
+            for sid, o, f, l in (con.execute(" union all ".join(parts)) if parts else []):
+                tok = float(o or 0)
+                if tok <= 0 or not (f or l):
+                    continue
+                lo, hi = day(f or l), day(l or f)
+                w = {d: n for d, n in act.get(sid, {}).items() if lo <= d <= hi}
+                tot = sum(w.values())
+                if not tot:
+                    w, tot = {hi: 1}, 1
+                for d, n in w.items():
+                    out[d] = out.get(d, 0.0) + tok * n / tot
+            val = out or None
+        finally:
+            con.close()
+    except Exception:
+        val = _HERMES_DAYS["val"]
+    _HERMES_DAYS["val"] = val
+    return val
+
+
+
+def hermes_usage(path=None, every=60.0):
+    """Every token the assistant harness has recorded, per model, on all the engines it used: the
+    session_model_usage table of the state DB (since late July) plus session_model_usage_v21 (the earlier schema,
+    20-06 -> 27-07; the two do not overlap). input_tokens is the COMPUTED prompt, cache_read_tokens the one taken
+    from cache: the whole prompt is the sum. Only the harness's own traffic (not vault cards, benchmarks, direct
+    calls). Read read-only at most once a minute: the file weighs 1.3 GB but the tables ~2,400 rows."""
+    now = time.time()
+    if now - _HERMES_USE["at"] < every:
+        return _HERMES_USE["val"]
+    _HERMES_USE["at"] = now
+    path = path or config.HERMES_DB
+    val = None
+    try:
+        import sqlite3
+        con = sqlite3.connect("file:%s?mode=ro" % path, uri=True, timeout=1.0)
+        try:
+            cols = "model, api_call_count, input_tokens, cache_read_tokens, output_tokens, reasoning_tokens, first_seen"
+            have = {r[0] for r in con.execute("select name from sqlite_master where type='table'")}
+            parts = ["select %s from session_model_usage" % cols] if "session_model_usage" in have else []
+            if "session_model_usage_v21" in have:
+                parts.append("select %s from session_model_usage_v21%s" % (cols, (
+                    " where session_id not in (select session_id from session_model_usage)" if parts else "")))
+            if parts:
+                q = ("select model, sum(api_call_count), sum(input_tokens), sum(cache_read_tokens), sum(output_tokens), "
+                     "sum(reasoning_tokens), min(first_seen) from (%s) group by model" % " union all ".join(parts))
+                models = [(m or "?", int(c or 0), int(i or 0), int(cr or 0), int(o or 0), int(r or 0), f)
+                          for m, c, i, cr, o, r, f in con.execute(q)]
+                models.sort(key=lambda x: -(x[2] + x[3] + x[4]))
+                if models:
+                    val = {"models": models, "calls": sum(x[1] for x in models), "in": sum(x[2] for x in models),
+                           "cached": sum(x[3] for x in models), "out": sum(x[4] for x in models),
+                           "reasoning": sum(x[5] for x in models),
+                           "since": min((x[6] for x in models if x[6]), default=None)}
+        finally:
+            con.close()
+    except Exception:
+        val = _HERMES_USE["val"]            # a locked or missing db: keep the last good reading
+    _HERMES_USE["val"] = val
+    return val
+
+
+
+_TF_FILL = {"pos": {}, "done": 0.0}
+
+
+
+_TF_HEALTH = {"at": None}   # rank 0's /health, read by tf_fill: ok, busy, iteration_s (the TP panel)
+
+
+
+def tf_fill(port):
+    """Kit image y3: the /health "fill" field says, for every stream in prefill, how many prompt lines are already
+    in and how many there are in total. Returns (streams in prefill, lines in, prompt lines) of the longest prompt,
+    and sums the lines COMPUTED since the last read into a monotone counter: that is the live prefill, because the
+    /metrics prompt counters close at request end. A stream's first read is the base: if it restarts from a held
+    state, the cached part is not prefill. Without "fill" (image y2) only the stream count."""
+    txt = http_get("http://127.0.0.1:%d/health" % port, timeout=2, tries=1)
+    try:
+        h = json.loads(txt) if txt else {}
+    except ValueError:
+        h = {}
+    if not isinstance(h, dict):
+        h = {}
+    n = int((h.get("streams") or {}).get("filling") or 0)
+    if h:
+        _TF_HEALTH.update(at=time.monotonic(), ok=h.get("ok"), busy=h.get("busy"), fatal=h.get("fatal"),
+                          iteration_s=h.get("iteration_s"), fill=isinstance(h.get("fill"), list))
+    fill = h.get("fill")
+    if not isinstance(fill, list):
+        return n, None, None
+    seen = {}
+    for f in fill:
+        key, pos = (f.get("sid"), f.get("prompt")), int(f.get("pos") or 0)
+        seen[key] = pos
+        if key in _TF_FILL["pos"] and pos > _TF_FILL["pos"][key]:
+            _TF_FILL["done"] += pos - _TF_FILL["pos"][key]
+    _TF_FILL["pos"] = seen
+    if not fill:
+        return n, 0, 0
+    big = max(fill, key=lambda f: int(f.get("prompt") or 0))
+    return n, int(big.get("pos") or 0), int(big.get("prompt") or 0)
+
+
+
+def tf_last_from_counters(reqs, prompt, cached):
+    """Kit image: no requests.jsonl. Prompt and cached of the last closed request = by how much the counters rose
+    when requests_total rose (if two close between two reads, it is their sum)."""
+    d = _TF_DELTA
+    if d["reqs"] is not None and reqs < d["reqs"]:
+        d["last"] = {}                                     # restart: the counters start from zero again
+    elif d["reqs"] is not None and reqs > d["reqs"]:
+        d["last"] = {"prompt": int(prompt - d["prompt"]), "cached": int(cached - d["cached"])}
+    d["reqs"], d["prompt"], d["cached"] = reqs, prompt, cached
+    return d["last"]
+
+
+
+def synth_tensorfold(mx, port, yzq):
+    """(mx, slots) in llama.cpp shape for TensorFold, from its /metrics. (None, None) if it is not TensorFold.
+    Two dialects: tensorfold_* (jayleaton, glm53tf) and tensorfold:* + tensorfold_health:* (the newer kit on
+    TensorFold v0.5.0, since 01-10), which additionally counts drafted tokens (mtp_drafted/accepted: DFlash2 + copy)."""
+    new = "tensorfold_health:requests_total" in mx
+    if "tensorfold_requests_total" not in mx and not new:
+        return None, None
+    if new:
+        comp = mx.get("tensorfold_health:completion_tokens_total", mx.get("tensorfold:generation_tokens_total", 0.0))
+        reqs = mx.get("tensorfold_health:requests_total", 0.0)
+        rounds = mx.get("tensorfold_health:rounds_total", 0.0)
+        prompt = mx.get("tensorfold:prompt_tokens_total", 0.0)
+        cached = mx.get("tensorfold_health:cached_tokens_total", 0.0)
+        inflight = mx.get("tensorfold:requests_running", 0.0)
+    else:
+        comp = mx.get("tensorfold_completion_tokens_total", 0.0)
+        reqs = mx.get("tensorfold_requests_total", 0.0)
+        rounds = mx.get("tensorfold_decode_rounds_total", 0.0)
+        prompt = mx.get("tensorfold_prompt_tokens_total", 0.0)
+        cached = mx.get("tensorfold_cached_tokens_total", 0.0)
+        inflight = mx.get("tensorfold_requests_inflight", 0.0)
+    tpr = (comp - reqs) / rounds if rounds > 0 else 1.0
+    # newer kit: completion_tokens_total already counts the tokens of in-flight replies (verified 01-10: +31 in 10 s
+    # with requests and rounds still), so the estimate from the gateway's SSE events would count them twice
+    live_tok = 0.0 if new else yzq_live_sse(yzq) * max(1.0, tpr)
+    # made monotone by hand as for tabby: when a request closes the in-flight estimate disappears and the true
+    # number arrives, and a drop would be read as a restart. A REAL restart lowers the closed counters: there it restarts.
+    if comp < _TF_MONO["comp"]:
+        _TF_MONO["gen"] = 0.0
+    _TF_MONO["comp"] = comp
+    gen = comp + live_tok
+    if gen < _TF_MONO["gen"]:
+        gen = _TF_MONO["gen"]
+    else:
+        _TF_MONO["gen"] = gen
+    ctxmax = (mx.get("tensorfold_health:context_length") if new else None) or vllm_ctxmax(port)
+    out = {
+        "tensorfold:records": reqs,
+        "tensorfold:prompt_total": prompt,
+        "tensorfold:cached_total": cached,
+    }
+    life = None if new else tf_lifetime()       # requests.jsonl is the jayleaton engine's: the newer kit does not write it
+    if life and life["n"]:
+        out.update({"tensorfold:all_in": float(life["in"]), "tensorfold:all_cached": float(life["cached"]),
+                    "tensorfold:all_out": float(life["out"]), "tensorfold:all_n": float(life["n"]),
+                    "tensorfold:all_since": float(life["since"] or 0)})
+    out.update({
+        "llamacpp:tokens_predicted_total": gen,
+        # only the COMPUTED tokens, like local_compute on vLLM: the cached cost no prefill
+        "llamacpp:prompt_tokens_total": max(0.0, prompt - cached),
+        "llamacpp:prompt_seconds_total": mx.get("tensorfold_health:prefill_seconds_total" if new else
+                                                "tensorfold_prefill_seconds_total", 0.0),
+        "llamacpp:requests_processing": inflight,
+        "llamacpp:requests_deferred": float((yzq or {}).get("high") or 0) + float((yzq or {}).get("low") or 0),
+        "llamacpp:n_tokens_max": float(ctxmax),
+        "llamacpp:spec_decode_num_drafts_total": rounds,
+        "llamacpp:spec_decode_num_accepted_tokens_total": max(0.0, comp - reqs - rounds),
+    })
+    if new and "tensorfold:mtp_drafted_total" in mx:
+        out.update({"tensorfold:has_drafted": 1.0,
+                    "llamacpp:spec_decode_num_draft_tokens_total": mx["tensorfold:mtp_drafted_total"],
+                    "llamacpp:spec_decode_num_accepted_tokens_total": mx.get("tensorfold:mtp_accepted_total", 0.0)})
+    rec = tf_last_from_counters(reqs, prompt, cached) if new else (tf_last_record() or {})
+    if new:
+        fill_n, fill_pos, fill_len = tf_fill(port)
+        out["tensorfold:fill_streams"] = float(fill_n)
+        if fill_len is not None:
+            out["tensorfold:fill_pos"], out["tensorfold:fill_len"] = float(fill_pos), float(fill_len)
+    slots = [{
+        "next_token": {"n_decoded": int(gen)},
+        # 0 ON PURPOSE, as for tabby: prefill is read from the closed counters (prompt/seconds), not from a progress.
+        # With the newer kit image y3 instead there is a real progress (tf_fill): the computed lines, monotone
+        "n_prompt_tokens_processed": int(_TF_FILL["done"]) if new else 0,
+        "n_prompt_tokens": int(rec.get("prompt") or 0),
+        "n_prompt_tokens_cache": int(rec.get("cached") or 0),
+        "n_ctx": int(ctxmax),
+        "is_processing": inflight > 0,
+    }]
+    return out, slots
+
+
+
+def tf_env(names=("glm53-flash-tf", "glm53-tf-r0")):
+    """The running rank-0 container's environment (GLM53_TF_* knobs on the jayleaton kit, TF_GLM_* on MiaAI's), via
+    docker: the process inside runs as root, so /proc/<pid>/environ is not readable from here."""
+    for name in names:
+        try:
+            out = subprocess.run(["docker", "inspect", "-f", "{{range .Config.Env}}{{println .}}{{end}}", name],
+                                 capture_output=True, text=True, timeout=5).stdout
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if out.strip():
+            return dict(l.split("=", 1) for l in out.splitlines() if "=" in l)
+    return {}
+
+# ==================== suzu/fetch/rank1.py
+"""Rank-1 (tensor-parallel peer) probe and the RoCE link read."""
+
 
 
 class Rank1Feed:
@@ -814,6 +2166,7 @@ class Rank1Feed:
         return info
 
 
+
 def _rank1_feed(url=None):
     """One feed per PROCESS, not per copy of this module. A reload closes the previous copy's feed."""
     import atexit
@@ -840,7 +2193,9 @@ def _rank1_feed(url=None):
     return feed
 
 
+
 _RANK1 = _rank1_feed()
+
 
 
 def fetch_rank1(url=None, tf=False):
@@ -854,7 +2209,9 @@ def fetch_rank1(url=None, tf=False):
     return _RANK1.info(tf=tf)
 
 
+
 _ROCE = {"prev": None, "tx": None, "rx": None, "pk": 0.0, "devs": ()}
+
 
 
 def roce_link():
@@ -890,1111 +2247,43 @@ def roce_link():
     _ROCE["devs"] = tuple(devs)
     return _ROCE["tx"], _ROCE["rx"], _ROCE["pk"], _ROCE["devs"]
 
+# ==================== suzu/render/core.py
+"""View state: construction, theme cycling, ramps, smoothing, tick."""
 
-_MEMINFO = {"at": 0.0, "info": None, "pid": None}
 
 
-def fetch_memory(pid=None):
-    """Host memory picture, /proc only - the repo's RAM stage adapted to
-    GB10 unified memory, where nvidia-smi reports VRAM as [N/A] because the
-    weights and the desktop swim in the same pool. The engine number is its
-    full resident set (RssFile+RssAnon): on GB10 the weights sit in CUDA
-    unified memory, which RSS cannot tag as 'file', so RssFile alone would
-    show a meaningless ~0.4 GB."""
-    now = time.time()
-    if _MEMINFO["info"] is not None and now - _MEMINFO["at"] < 2.0 \
-            and _MEMINFO["pid"] == pid:
-        return _MEMINFO["info"]
-    mi = {"total": None, "avail": None, "used_frac": None, "rss": None}
-    try:
-        with open("/proc/meminfo") as f:
-            vals = {}
-            for line in f:
-                k, _, rest = line.partition(":")
-                vals[k.strip()] = float(rest.split()[0])   # kB
-        mi["total"] = vals.get("MemTotal")
-        mi["avail"] = vals.get("MemAvailable")
-        if mi["total"]:
-            used = mi["total"] - (mi["avail"] or 0.0)
-            mi["used_frac"] = max(0.0, min(1.0, used / mi["total"]))
-    except (OSError, ValueError):
-        pass
-    if pid:
-        try:
-            with open("/proc/%s/status" % pid) as f:
-                rf = ra = None
-                for line in f:
-                    if line.startswith("RssFile:"):
-                        rf = float(line.split()[1])    # kB, file-backed
-                    elif line.startswith("RssAnon:"):
-                        ra = float(line.split()[1])    # kB, anonymous
-                if rf is not None or ra is not None:
-                    mi["rss"] = (rf or 0.0) + (ra or 0.0)
-        except (OSError, ValueError):
-            pass
-    _MEMINFO["info"], _MEMINFO["at"], _MEMINFO["pid"] = mi, now, pid
-    return mi
+def _smooth(prev, target, dt, tau_up, tau_down):
+    """Exponential approach, fast up / slow down - fade.rs smooth()."""
+    tau = tau_up if target > prev else tau_down
+    a = 1.0 - 2.718281828459045 ** (-dt / max(tau, 0.001))
+    v = prev + (target - prev) * a
+    return max(0.0, min(1.0, v))
 
 
-def fetch_slots(port):
-    txt = http_get("http://127.0.0.1:%d/slots" % port, timeout=3, tries=1)
-    if not txt:
-        return None
-    try:
-        j = json.loads(txt)
-        return j if isinstance(j, list) else None
-    except (json.JSONDecodeError, ValueError):
-        return None
 
-
-_VLLM_POOL = {}
-_VLLM_CTXMAX = {}
-
-
-def vllm_pool(port):
-    """KV pool size in tokens, from the boot log ("GPU KV cache size: N tokens").
-
-    Not derivable from /metrics: `vllm:cache_config_info` reports num_gpu_blocks
-    12355 x block_size 4 = 49,420 on a real pool of 2,192,815 (measured 21-08),
-    because the hybrid cache (128-token sliding-window layers beside the global
-    ones) is not that product. `docker logs` costs ~10 s: memoized on container
-    id + StartedAt, so a restart invalidates the cache by itself.
-    """
-    if port in _VLLM_POOL:
-        return _VLLM_POOL[port]
-    _VLLM_POOL[port] = None
-    try:
-        names = subprocess.run(["docker", "ps", "--format", "{{.Names}}"],
-                               capture_output=True, text=True, timeout=8).stdout.split()
-        name = next((x for x in names
-                     if any(t in x for t in ("vllm", "spark", "sglang"))), None)
-        if not name:
-            return None
-        key = subprocess.run(["docker", "inspect", "-f", "{{.Id}}-{{.State.StartedAt}}", name],
-                             capture_output=True, text=True, timeout=8).stdout.strip()
-        cache = "/tmp/yz-kvpool-" + re.sub(r"[^A-Za-z0-9]", "", key)[:40] if key else None
-        if cache and os.path.exists(cache):
-            _VLLM_POOL[port] = int(open(cache).read().strip())
-            return _VLLM_POOL[port]
-        log = subprocess.run(["docker", "logs", "--tail", "4000", name],
-                             capture_output=True, text=True, timeout=40)
-        hits = re.findall(r"GPU KV cache size: ([\d,]+) tokens", log.stdout + log.stderr)
-        if hits:
-            _VLLM_POOL[port] = int(hits[-1].replace(",", ""))
-            if cache:
-                open(cache, "w").write(str(_VLLM_POOL[port]))
-    except Exception:
-        pass
-    return _VLLM_POOL[port]
-
-
-def vllm_ctxmax(port):
-    """max_model_len from /v1/models: on vLLM there is no llamacpp:n_tokens_max."""
-    if port in _VLLM_CTXMAX:
-        return _VLLM_CTXMAX[port]
-    _VLLM_CTXMAX[port] = 0
-    txt = http_get("http://127.0.0.1:%d/v1/models" % port, timeout=4, tries=1)
-    if txt:
-        try:
-            _VLLM_CTXMAX[port] = int(json.loads(txt)["data"][0].get("max_model_len") or 0)
-        except (ValueError, KeyError, IndexError, TypeError):
-            pass
-    return _VLLM_CTXMAX[port]
-
-
-def synth_slots_vllm(mx, port):
-    """Synthetic slot for vLLM, which does NOT expose /slots.
-
-    On llama.cpp the /metrics counters are flushed at request end, which is why
-    this monitor reads /slots. On vLLM it is the OPPOSITE, measured by sampling
-    every 2 s inside a single request (21-08 on dsflash):
-
-        t1 draft=530  acc=298 gen=400      <- not started yet
-        t3 draft=725  acc=395 gen=537
-        t6 draft=1035 acc=502 gen=706      <- still in flight
-
-    So it is enough to remap /metrics into the shape of a llama.cpp slot and the
-    whole TUI works without touching anything else. Two differences to keep in
-    mind:
-      - `n_decoded` here is a LIFETIME counter, not reset per request: deltas
-        stay >= 0, so the "negative delta = new task" branch never fires
-        (harmless).
-      - prefill is not visible on `vllm:prompt_tokens_total`, credited only at
-        request CLOSE (measured: 48 after killing a 900k prefill halfway). The
-        only reading that advances during a long prefill is
-        `kv_cache_usage_perc` -> progress is that fraction of the pool.
-    Without the pool (unreadable log) it returns 0 on ptok/n_ctx: the slot panel
-    switches itself off and the rest of the TUI stays valid.
-    """
-    if not any(k.startswith("vllm:") for k in mx):
-        return None
-    pool = vllm_pool(port) or 0
-    ptok = int(mx.get("vllm:kv_cache_usage_perc", 0.0) * pool)
-    q = mx.get("vllm:prefix_cache_queries_total", 0.0)
-    h = mx.get("vllm:prefix_cache_hits_total", 0.0)
-    return [{
-        "next_token": {"n_decoded": int(mx.get("vllm:generation_tokens_total", 0.0))},
-        "n_prompt_tokens_processed": ptok,
-        "n_prompt_tokens": ptok,
-        "n_prompt_tokens_cache": int(ptok * h / q) if q > 0 else 0,
-        "n_ctx": int(pool),
-        "is_processing": mx.get("vllm:num_requests_running", 0.0) > 0,
-    }]
-
-
-# ------------------------------------------------------ tabby / exllamav3 ---
-# TabbyAPI (entry glm53x, GLM-5.3-Flash EXL3) exposes NONE of what this file is
-# built on: /metrics 404, /slots 404, zero counters. Until 29-08 the spec view
-# on that entry only said "no engine on :30001", and it was the DAILY engine.
-# The three sources that remain, and what is taken from each:
-#
-#   /props        n_ctx and total_slots: the only two numbers TabbyAPI gives
-#                 already in llama.cpp's shape (it has a /props compat layer).
-#   gateway stats the tokens WHILE they stream. The gateway sits in front of the
-#                 engine and relays the SSE events itself, so since 29-08 it
-#                 counts them: tokens_total advances inside the request exactly
-#                 like n_decoded on /slots, which was the only thing needed.
-#   engine log    the `Metrics (ID: ...)` line TabbyAPI writes at request
-#                 CLOSE: generated tokens, seconds, queue, prefill cached/new,
-#                 prefill and decode T/s, context, and — only with MTP on —
-#                 `Draft: acc / tot tokens accepted`, i.e. the ACCEPTANCE,
-#                 the number this panel exists for.
-#
-# Everything is remapped onto `llamacpp:` keys plus one synthetic slot: Sample,
-# the delta window and the whole TUI stay unchanged, exactly as was done for
-# vLLM with synth_slots_vllm.
-_TABBY_PROPS = {}
-_TAB_ZERO = {"gen": 0, "new": 0, "ps": 0.0, "acc": 0, "draft": 0, "n": 0}
-_TABBY_LOG = {"path": None, "off": 0, "carry": None, "tot": dict(_TAB_ZERO),
-              "last": None}
-_TABBY_MONO = {"gen": 0.0}
-# Calibration of SSE events -> tokens. The gateway counts the EVENTS it relays,
-# and TabbyAPI packs several tokens into one (output_chunking): measured 29-08,
-# 120 events for 360 real tokens, factor 3.0 on digits-only text. The factor
-# depends on the content, so it is not written by hand: it is measured. Each
-# time a record closes in the log, how many tokens the engine says is compared
-# with how many events the gateway counted IN THE SAME INTERVAL, and the
-# cumulative ratio scales the estimate of the piece still in flight. Until not
-# even one record has closed the factor is 1 and the live t/s is UNDERSTATED:
-# it lasts one request.
-_TABBY_KFILE = "/tmp/yz-tabby-k"
-
-
-def _tabby_k0():
-    """Last calibrated factor, saved by a previous panel run. Without it the
-    FIRST request after each engine start would read at a third of truth."""
-    try:
-        k = float(open(_TABBY_KFILE).read().strip())
-        return k if 0.5 <= k <= 12.0 else 0.0
-    except (OSError, ValueError):
-        return 0.0
-
-
-_TABBY_RATIO = {"gen": 0.0, "ev": 0.0, "p_gen": None, "p_ev": None, "p_n": None,
-                "saved": _tabby_k0()}
-
-_TS_RE = re.compile(r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d")
-_TAB_GEN = re.compile(r"(\d+) tokens generated in\s+([\d.]+) seconds")
-_TAB_Q = re.compile(r"Queue:\s+([\d.]+) s")
-_TAB_P = re.compile(r"Process:\s+(\d+) cached tokens and\s+(\d+) new tokens at\s+([\d.]+) T/s")
-_TAB_G = re.compile(r"Generate:\s+([\d.]+) T/s")
-_TAB_C = re.compile(r"Context:\s+(\d+) tokens")
-_TAB_D = re.compile(r"Draft:\s+(\d+) / (\d+) tokens accepted")
-
-
-def proc_env(pid):
-    """A process environment. TabbyAPI's knobs live THERE, not on the command
-    line: the config file deliberately stays silent on the dynamic keys and
-    the launcher passes them as TABBY_* (with --config X the other flags are
-    ignored, tabby_config.py:141)."""
-    env = {}
-    try:
-        with open("/proc/%s/environ" % pid, "rb") as f:
-            for kv in f.read().split(b"\0"):
-                if b"=" in kv:
-                    a, _, b = kv.partition(b"=")
-                    env[a.decode("utf-8", "replace")] = b.decode("utf-8", "replace")
-    except OSError:
-        pass
-    return env
-
-
-def tabby_env():
-    """TabbyAPI's process environment, or {}. The tmux line is skipped: it is
-    the wrapper and carries the same command line."""
-    try:
-        out = subprocess.run(["ps", "-ww", "-eo", "pid=,args="],
-                             capture_output=True, text=True, timeout=4).stdout
-    except (OSError, subprocess.SubprocessError):
-        return {}
-    for line in out.splitlines():
-        parts = line.strip().split(None, 1)
-        if len(parts) < 2:
-            continue
-        args = parts[1]
-        if "main.py" not in args or "tabby" not in args:
-            continue
-        if os.path.basename(args.split(None, 1)[0]) in ("tmux", "sh", "bash"):
-            continue
-        env = proc_env(parts[0])
-        if env:
-            return env
-    return {}
-
-
-def tabby_props(port):
-    """n_ctx and slots. Memoized ONLY on success: during the load (30-40 s at
-    512k) /props does not answer, and memoizing the hole would have switched the
-    tabby branch off for the whole life of the panel.
-
-    ⚠ /props is not reliable as a PRESENCE probe. Measured 29-08: under a long
-    prefill TabbyAPI stays mute for up to 20 s, and a panel that concludes "no
-    engine" at that moment switches off EXACTLY when the engine works — which is
-    the defect this file exists for. So if /props stays silent it falls back to
-    the process environment, where the launcher already wrote
-    TABBY_MODEL_MAX_SEQ_LEN: not an estimate, it is the same number the server
-    received at startup.
-    """
-    if _TABBY_PROPS.get(port):
-        return _TABBY_PROPS[port]
-    n, slots = 0, 0
-    txt = http_get("http://127.0.0.1:%d/props" % port, timeout=6, tries=2)
-    if txt:
-        try:
-            j = json.loads(txt)
-            n = int((j.get("default_generation_settings") or {}).get("n_ctx") or 0)
-            slots = int(j.get("total_slots") or 0)
-        except (ValueError, TypeError, AttributeError):
-            n = 0
-    if n <= 0:
-        try:
-            n = int(tabby_env().get("TABBY_MODEL_MAX_SEQ_LEN") or 0)
-        except (ValueError, TypeError):
-            n = 0
-    if n <= 0:
-        return {}
-    _TABBY_PROPS[port] = {"n_ctx": n, "slots": slots or 1}
-    return _TABBY_PROPS[port]
-
-
-def tabby_parse(rec):
-    """A gathered `Metrics (ID: ...)` record -> dict, or None if it is not one."""
-    rec = re.sub(r"\s+", " ", rec)
-    mg, mp = _TAB_GEN.search(rec), _TAB_P.search(rec)
-    if not mg or not mp:
-        return None
-    mq, mgg, mc, md = (_TAB_Q.search(rec), _TAB_G.search(rec),
-                       _TAB_C.search(rec), _TAB_D.search(rec))
-    return {
-        "gen": int(mg.group(1)), "sec": float(mg.group(2)),
-        "queue": float(mq.group(1)) if mq else 0.0,
-        "cached": int(mp.group(1)), "new": int(mp.group(2)),
-        "ptps": float(mp.group(3)),
-        "gtps": float(mgg.group(1)) if mgg else 0.0,
-        "ctx": int(mc.group(1)) if mc else 0,
-        "acc": int(md.group(1)) if md else 0,
-        "draft": int(md.group(2)) if md else 0,
-    }
-
-
-def tabby_scan(path, maxbytes=262144):
-    """(cumulative totals, last record) from the `Metrics (ID: ...)` lines.
-
-    ⚠ The log is written by rich WITHOUT a tty: the console falls back to 80
-    columns and EVERY record comes out split over 3-4 lines, sometimes in the
-    middle of a field ("Queue:" / "0.01 s"). Continuation lines carry no
-    timestamp, and that is how they are recognised; they are rejoined and the
-    spaces normalized before reading the numbers. (From today the glm53x entry
-    launches with TABBY_LOG_CONSOLE_WIDTH: NEW logs sit on a single line, the
-    unwrap is for the ones already written and for a hand-started engine.)
-
-    ⚠ The totals are ACCUMULATED, not recomputed over the file tail. It seemed
-    simpler to re-sum the last 256 KB at every tick, but that window SLIDES: as
-    soon as the log outgrows it the cumulatives DROP, and a drop here is
-    exactly what Sample.restarted_from reads as "engine restarted" -> panel
-    history thrown away every few minutes. So only the NEW tail is read
-    (offset), and the window only decides where to start the first time. A real
-    restart (different file, or shorter than before) deliberately zeroes
-    everything.
-    """
-    st = _TABBY_LOG
-    if not path:
-        return dict(st["tot"]), st["last"]
-    try:
-        size = os.path.getsize(path)
-    except OSError:
-        return dict(st["tot"]), st["last"]
-    if st["path"] != path or size < st["off"]:
-        # First read or rotated log. Start from the tail: the rest of the file
-        # is another engine session's history. The cut falls in the middle of
-        # a line, which lacking the timestamp discards itself.
-        st.update(path=path, off=max(0, size - maxbytes), carry=None,
-                  tot=dict(_TAB_ZERO), last=None)
-        _TABBY_MONO["gen"] = 0.0
-        _TABBY_PROPS.clear()             # new engine = re-read n_ctx
-    if size <= st["off"]:
-        return dict(st["tot"]), st["last"]
-    try:
-        with open(path, "rb") as f:
-            f.seek(st["off"])
-            data = f.read(size - st["off"])
-    except OSError:
-        return dict(st["tot"]), st["last"]
-    cut = data.rfind(b"\n")              # the half line is read on the next round
-    if cut < 0:
-        return dict(st["tot"]), st["last"]
-    st["off"] += cut + 1
-    buf, tot = st["carry"], st["tot"]
-    for ln in ANSI_RE.sub("", data[:cut].decode("utf-8", "replace")).splitlines():
-        if _TS_RE.match(ln):
-            if buf is not None:
-                rec = tabby_parse(buf)
-                if rec:
-                    tot["gen"] += rec["gen"]
-                    tot["new"] += rec["new"]
-                    tot["acc"] += rec["acc"]
-                    tot["draft"] += rec["draft"]
-                    tot["n"] += 1
-                    if rec["ptps"] > 0:
-                        tot["ps"] += rec["new"] / rec["ptps"]
-                    st["last"] = rec
-                buf = None
-            if "Metrics (ID:" in ln:
-                buf = ln
-        elif buf is not None:
-            buf += " " + ln.strip()
-    st["carry"] = buf                    # record still open: it closes next round
-    return dict(tot), st["last"]
-
-
-def tabby_scale(tot, ev_total, ev_live):
-    """In-flight SSE events -> tokens, using the factor calibrated on closed
-    records.
-
-    The baseline (p_gen, p_ev) moves ONLY when a record closes (tot["n"]
-    grows): that way the two deltas cover the same set of requests. If it
-    were updated every tick, the piece still in flight — events counted,
-    tokens not yet written to the log — would drag the ratio down
-    continuously.
-    """
-    r = _TABBY_RATIO
-    if r["p_ev"] is None or ev_total < r["p_ev"] or tot["gen"] < (r["p_gen"] or 0):
-        # first round, or gateway/engine restarted: restart from the current base
-        r.update(gen=0.0, ev=0.0, p_gen=float(tot["gen"]), p_ev=ev_total,
-                 p_n=tot["n"])
-    elif r["p_n"] is not None and tot["n"] > r["p_n"]:
-        r["gen"] += float(tot["gen"]) - r["p_gen"]
-        r["ev"] += ev_total - r["p_ev"]
-        r["p_gen"], r["p_ev"], r["p_n"] = float(tot["gen"]), ev_total, tot["n"]
-    if r["ev"] >= 20 and r["gen"] > 0:
-        k = r["gen"] / r["ev"]
-        if abs(k - r["saved"]) > 0.05:
-            r["saved"] = k
-            try:                          # so the next panel starts calibrated
-                with open(_TABBY_KFILE, "w") as f:
-                    f.write("%.4f" % k)
-            except OSError:
-                pass
-    else:
-        k = r["saved"] or 1.0
-    return ev_live * k
-
-
-def synth_tabby(port, llm, yzq):
-    """(mx, slots) in llama.cpp shape for TabbyAPI. (None, None) if absent.
-
-    The only counter that advances WITHIN the request is the gateway's, and for
-    that reason it plays `tokens_predicted_total`: the log records arrive after
-    the fact. The two are summed (closed + in flight) and the sum is made
-    monotone by hand, because in the instant between "the client hangs up" and
-    "TabbyAPI writes the record" the in-flight piece disappears and a drop
-    would be read as an engine restart, wiping the whole panel history.
-    """
-    props = tabby_props(port)
-    if not props:
-        return None, None
-    tot, last = tabby_scan(active_log(llm))
-    inf = (yzq or {}).get("inflight") or {}
-    live_tok = tabby_scale(tot, float((yzq or {}).get("sse_total") or 0.0), yzq_live_sse(yzq))
-    gen = float(tot["gen"] + live_tok)
-    if gen < _TABBY_MONO["gen"]:
-        gen = _TABBY_MONO["gen"]
-    else:
-        _TABBY_MONO["gen"] = gen
-    pp, ps, acc, dra = float(tot["new"]), tot["ps"], tot["acc"], tot["draft"]
-    mx = {
-        "tabby:records": float(tot["n"]),
-        "llamacpp:tokens_predicted_total": gen,
-        "llamacpp:prompt_tokens_total": pp,
-        "llamacpp:prompt_seconds_total": ps,
-        "llamacpp:requests_processing": 1.0 if inf else 0.0,
-        "llamacpp:requests_deferred": float((yzq or {}).get("high") or 0)
-                                      + float((yzq or {}).get("low") or 0),
-        "llamacpp:n_tokens_max": float(props["n_ctx"]),
-    }
-    # The two speculative keys exist ONLY with MTP on: with draft_mode=disabled
-    # TabbyAPI writes no `Draft:` and the panel must say "No speculation", not
-    # 0% (which would mean "speculates and always gets it wrong").
-    if dra > 0:
-        mx["llamacpp:spec_decode_num_draft_tokens_total"] = float(dra)
-        mx["llamacpp:spec_decode_num_accepted_tokens_total"] = float(acc)
-    slots = [{
-        "next_token": {"n_decoded": live_tok},
-        # 0 ON PURPOSE: there is no prefill progress to sample here, and putting
-        # the last closed record's tokens there would read as "prefill done in
-        # one tick" -> spikes of thousands of t/s. With 0 the step() branch
-        # falls back to prompt_tokens/prompt_seconds, the true ratio because
-        # both come from the same records.
-        "n_prompt_tokens_processed": 0,
-        # ⚠ the denominator is NOT `Context:` alone. On an interrupted request
-        # (the gateway preempts the low lane) TabbyAPI logs a context smaller
-        # than the tokens it already had in cache, and the prefix bar reached
-        # 131% — measured 29-08. cached+new is what the engine really had in
-        # hand, so the ratio goes back under 1 without lying.
-        "n_prompt_tokens": max((last or {}).get("ctx") or 0,
-                               ((last or {}).get("cached") or 0)
-                               + ((last or {}).get("new") or 0)),
-        "n_prompt_tokens_cache": (last or {}).get("cached") or 0,
-        "n_ctx": props["n_ctx"],
-        "is_processing": bool(inf),
-    }]
-    return mx, slots
-
-
-# ------------------------------------------------------------- tensorfold ---
-# TensorFold (entry glm53tf, the main engine since 30-09) has /metrics, but in its own language (tensorfold_*), and like
-# llama.cpp it closes the counters at request END (measured 30-09: decode_seconds_total +24.9 s in 4 s of wall clock,
-# one record closed in between). There is no /slots. Same recipe as tabby, three sources:
-#   /metrics        generated tokens, prompt, cached, prefill seconds, decode rounds (at request close)
-#   gateway stats   the SSE events WHILE they stream. TensorFold sends ONE per verify round (server.py
-#                   on_tokens: the accepted-token list becomes a delta), so events x tokens/round = tokens.
-#   requests.jsonl  one JSON line per closed request (patch 0300, no text): prompt and cached of the last one. It sits
-#                   on the sessions' NVMe tier, which the container mounts as /sessions.
-# TensorFold does NOT count drafted tokens: an acceptance % does not exist, and none is invented here. There is tau =
-# accepted tokens per round = (completion - requests - rounds) / rounds, because the first token of every request
-# comes from the prefill (the same arithmetic as tpr_check in the repo's scripts/serve.sh).
-TF_REQLOG = os.path.expanduser("~/models/glm53-tf/sessions/requests.jsonl")
-_TF_MONO = {"gen": 0.0, "comp": 0.0}
-_TF_LAST = {"key": None, "rec": None}
-
-
-def tf_last_record(path=TF_REQLOG):
-    """The last closed request of the request log, re-read only when the file changes."""
-    try:
-        st = os.stat(path)
-    except OSError:
-        return None
-    key = (st.st_mtime, st.st_size)
-    if _TF_LAST["key"] == key:
-        return _TF_LAST["rec"]
-    rec = None
-    try:
-        with open(path, "rb") as f:
-            f.seek(max(0, st.st_size - 65536))
-            for line in reversed(f.read().splitlines()):
-                try:
-                    rec = json.loads(line)
-                    break
-                except (ValueError, UnicodeDecodeError):
-                    continue
-    except OSError:
-        pass
-    _TF_LAST["key"], _TF_LAST["rec"] = key, rec
-    return rec
-
-
-_TF_ALL = {"ino": None, "off": 0, "carry": b"", "in": 0, "cached": 0, "out": 0, "n": 0, "since": None}
-
-
-def tf_lifetime(path=TF_REQLOG):
-    """Totals over the whole request log, across engine restarts (the /metrics counters restart at every boot).
-    Incremental: only the bytes appended since the last call are parsed, so the file can grow for months."""
-    a = _TF_ALL
-    try:
-        st = os.stat(path)
-    except OSError:
-        return None
-    if a["ino"] != st.st_ino or st.st_size < a["off"]:        # new file, or truncated: count again from zero
-        a.update(ino=st.st_ino, off=0, carry=b"", **{"in": 0}, cached=0, out=0, n=0, since=None)
-    if st.st_size > a["off"]:
-        try:
-            with open(path, "rb") as f:
-                f.seek(a["off"])
-                buf = a["carry"] + f.read()
-                a["off"] = f.tell()
-        except OSError:
-            return a
-        lines = buf.split(b"\n")
-        a["carry"] = lines.pop()                               # a half-written last line waits for the next call
-        for line in lines:
-            try:
-                r = json.loads(line)
-            except (ValueError, UnicodeDecodeError):
-                continue
-            a["in"] += int(r.get("prompt") or 0)
-            a["cached"] += int(r.get("cached") or 0)
-            a["out"] += int(r.get("decode_tokens") or 0)
-            a["n"] += 1
-            if a["since"] is None:
-                a["since"] = r.get("start") or r.get("ts")
-    return a
-
-
-_TF_DELTA = {"reqs": None, "prompt": 0.0, "cached": 0.0, "last": {}}
-HERMES_DB = os.path.expanduser("~/.hermes/state.db")   # --tokens-db overrides
-LANES_URL = None        # optional gateway lanes endpoint (--lanes-url)
-RANK1_URL = None        # optional rank-1 metrics endpoint (--rank1-url)
-
-
-def _lanes_host():
-    """Host[:port] of --lanes-url, so the ps filter can skip a gateway process
-    (it is not the engine and its uptime would be reported as the model's)."""
-    try:
-        from urllib.parse import urlsplit
-        netloc = urlsplit(LANES_URL or "").netloc
-        return netloc.split("@")[-1] if netloc else ""
-    except ValueError:
-        return ""
-_HERMES_USE = {"at": -1e9, "val": None}
-_HERMES_DAYS = {"at": -1e9, "val": None}
-
-
-def hermes_days(path=None, every=600.0):
-    """GENERATED tokens per day (local "YYYY-MM-DD" -> output_tokens) across all models, from the assistant's
-    session traffic. Usage is not recorded per call but per session x model, with a first and last instant: each row
-    is attributed to the days on which that session wrote messages inside its window, in proportion to how many;
-    with no messages in the window, to the day of the last one. 90% of rows live less than 2.2 hours (measured
-    01-10): almost always a single day. Messages are counted on the idx_messages_session_active index (0.2 s on
-    207k rows), every 10 min."""
-    now = time.time()
-    if now - _HERMES_DAYS["at"] < every:
-        return _HERMES_DAYS["val"]
-    _HERMES_DAYS["at"] = now
-    path = path or HERMES_DB
-    day = lambda ts: time.strftime("%Y-%m-%d", time.localtime(ts))
-    val = None
-    try:
-        import sqlite3
-        con = sqlite3.connect("file:%s?mode=ro" % path, uri=True, timeout=1.0)
-        try:
-            have = {r[0] for r in con.execute("select name from sqlite_master where type='table'")}
-            act = {}
-            if "messages" in have:
-                for sid, d, n in con.execute("select session_id, date(timestamp, 'unixepoch', 'localtime'), count(*) "
-                                             "from messages where timestamp is not null group by session_id, 2"):
-                    act.setdefault(sid, {})[d] = n
-            cols = "session_id, output_tokens, first_seen, last_seen"
-            parts = ["select %s from session_model_usage" % cols] if "session_model_usage" in have else []
-            if "session_model_usage_v21" in have:
-                parts.append("select %s from session_model_usage_v21%s" % (cols, (
-                    " where session_id not in (select session_id from session_model_usage)" if parts else "")))
-            out = {}
-            for sid, o, f, l in (con.execute(" union all ".join(parts)) if parts else []):
-                tok = float(o or 0)
-                if tok <= 0 or not (f or l):
-                    continue
-                lo, hi = day(f or l), day(l or f)
-                w = {d: n for d, n in act.get(sid, {}).items() if lo <= d <= hi}
-                tot = sum(w.values())
-                if not tot:
-                    w, tot = {hi: 1}, 1
-                for d, n in w.items():
-                    out[d] = out.get(d, 0.0) + tok * n / tot
-            val = out or None
-        finally:
-            con.close()
-    except Exception:
-        val = _HERMES_DAYS["val"]
-    _HERMES_DAYS["val"] = val
-    return val
-
-
-def hermes_usage(path=None, every=60.0):
-    """Every token the assistant harness has recorded, per model, on all the engines it used: the
-    session_model_usage table of the state DB (since late July) plus session_model_usage_v21 (the earlier schema,
-    20-06 -> 27-07; the two do not overlap). input_tokens is the COMPUTED prompt, cache_read_tokens the one taken
-    from cache: the whole prompt is the sum. Only the harness's own traffic (not vault cards, benchmarks, direct
-    calls). Read read-only at most once a minute: the file weighs 1.3 GB but the tables ~2,400 rows."""
-    now = time.time()
-    if now - _HERMES_USE["at"] < every:
-        return _HERMES_USE["val"]
-    _HERMES_USE["at"] = now
-    path = path or HERMES_DB
-    val = None
-    try:
-        import sqlite3
-        con = sqlite3.connect("file:%s?mode=ro" % path, uri=True, timeout=1.0)
-        try:
-            cols = "model, api_call_count, input_tokens, cache_read_tokens, output_tokens, reasoning_tokens, first_seen"
-            have = {r[0] for r in con.execute("select name from sqlite_master where type='table'")}
-            parts = ["select %s from session_model_usage" % cols] if "session_model_usage" in have else []
-            if "session_model_usage_v21" in have:
-                parts.append("select %s from session_model_usage_v21%s" % (cols, (
-                    " where session_id not in (select session_id from session_model_usage)" if parts else "")))
-            if parts:
-                q = ("select model, sum(api_call_count), sum(input_tokens), sum(cache_read_tokens), sum(output_tokens), "
-                     "sum(reasoning_tokens), min(first_seen) from (%s) group by model" % " union all ".join(parts))
-                models = [(m or "?", int(c or 0), int(i or 0), int(cr or 0), int(o or 0), int(r or 0), f)
-                          for m, c, i, cr, o, r, f in con.execute(q)]
-                models.sort(key=lambda x: -(x[2] + x[3] + x[4]))
-                if models:
-                    val = {"models": models, "calls": sum(x[1] for x in models), "in": sum(x[2] for x in models),
-                           "cached": sum(x[3] for x in models), "out": sum(x[4] for x in models),
-                           "reasoning": sum(x[5] for x in models),
-                           "since": min((x[6] for x in models if x[6]), default=None)}
-        finally:
-            con.close()
-    except Exception:
-        val = _HERMES_USE["val"]            # a locked or missing db: keep the last good reading
-    _HERMES_USE["val"] = val
-    return val
-_TF_FILL = {"pos": {}, "done": 0.0}
-_TF_HEALTH = {"at": None}   # rank 0's /health, read by tf_fill: ok, busy, iteration_s (the TP panel)
-
-
-def tf_fill(port):
-    """Kit image y3: the /health "fill" field says, for every stream in prefill, how many prompt lines are already
-    in and how many there are in total. Returns (streams in prefill, lines in, prompt lines) of the longest prompt,
-    and sums the lines COMPUTED since the last read into a monotone counter: that is the live prefill, because the
-    /metrics prompt counters close at request end. A stream's first read is the base: if it restarts from a held
-    state, the cached part is not prefill. Without "fill" (image y2) only the stream count."""
-    txt = http_get("http://127.0.0.1:%d/health" % port, timeout=2, tries=1)
-    try:
-        h = json.loads(txt) if txt else {}
-    except ValueError:
-        h = {}
-    if not isinstance(h, dict):
-        h = {}
-    n = int((h.get("streams") or {}).get("filling") or 0)
-    if h:
-        _TF_HEALTH.update(at=time.monotonic(), ok=h.get("ok"), busy=h.get("busy"), fatal=h.get("fatal"),
-                          iteration_s=h.get("iteration_s"), fill=isinstance(h.get("fill"), list))
-    fill = h.get("fill")
-    if not isinstance(fill, list):
-        return n, None, None
-    seen = {}
-    for f in fill:
-        key, pos = (f.get("sid"), f.get("prompt")), int(f.get("pos") or 0)
-        seen[key] = pos
-        if key in _TF_FILL["pos"] and pos > _TF_FILL["pos"][key]:
-            _TF_FILL["done"] += pos - _TF_FILL["pos"][key]
-    _TF_FILL["pos"] = seen
-    if not fill:
-        return n, 0, 0
-    big = max(fill, key=lambda f: int(f.get("prompt") or 0))
-    return n, int(big.get("pos") or 0), int(big.get("prompt") or 0)
-
-
-def tf_last_from_counters(reqs, prompt, cached):
-    """Kit image: no requests.jsonl. Prompt and cached of the last closed request = by how much the counters rose
-    when requests_total rose (if two close between two reads, it is their sum)."""
-    d = _TF_DELTA
-    if d["reqs"] is not None and reqs < d["reqs"]:
-        d["last"] = {}                                     # restart: the counters start from zero again
-    elif d["reqs"] is not None and reqs > d["reqs"]:
-        d["last"] = {"prompt": int(prompt - d["prompt"]), "cached": int(cached - d["cached"])}
-    d["reqs"], d["prompt"], d["cached"] = reqs, prompt, cached
-    return d["last"]
-
-
-def synth_tensorfold(mx, port, yzq):
-    """(mx, slots) in llama.cpp shape for TensorFold, from its /metrics. (None, None) if it is not TensorFold.
-    Two dialects: tensorfold_* (jayleaton, glm53tf) and tensorfold:* + tensorfold_health:* (the newer kit on
-    TensorFold v0.5.0, since 01-10), which additionally counts drafted tokens (mtp_drafted/accepted: DFlash2 + copy)."""
-    new = "tensorfold_health:requests_total" in mx
-    if "tensorfold_requests_total" not in mx and not new:
-        return None, None
-    if new:
-        comp = mx.get("tensorfold_health:completion_tokens_total", mx.get("tensorfold:generation_tokens_total", 0.0))
-        reqs = mx.get("tensorfold_health:requests_total", 0.0)
-        rounds = mx.get("tensorfold_health:rounds_total", 0.0)
-        prompt = mx.get("tensorfold:prompt_tokens_total", 0.0)
-        cached = mx.get("tensorfold_health:cached_tokens_total", 0.0)
-        inflight = mx.get("tensorfold:requests_running", 0.0)
-    else:
-        comp = mx.get("tensorfold_completion_tokens_total", 0.0)
-        reqs = mx.get("tensorfold_requests_total", 0.0)
-        rounds = mx.get("tensorfold_decode_rounds_total", 0.0)
-        prompt = mx.get("tensorfold_prompt_tokens_total", 0.0)
-        cached = mx.get("tensorfold_cached_tokens_total", 0.0)
-        inflight = mx.get("tensorfold_requests_inflight", 0.0)
-    tpr = (comp - reqs) / rounds if rounds > 0 else 1.0
-    # newer kit: completion_tokens_total already counts the tokens of in-flight replies (verified 01-10: +31 in 10 s
-    # with requests and rounds still), so the estimate from the gateway's SSE events would count them twice
-    live_tok = 0.0 if new else yzq_live_sse(yzq) * max(1.0, tpr)
-    # made monotone by hand as for tabby: when a request closes the in-flight estimate disappears and the true
-    # number arrives, and a drop would be read as a restart. A REAL restart lowers the closed counters: there it restarts.
-    if comp < _TF_MONO["comp"]:
-        _TF_MONO["gen"] = 0.0
-    _TF_MONO["comp"] = comp
-    gen = comp + live_tok
-    if gen < _TF_MONO["gen"]:
-        gen = _TF_MONO["gen"]
-    else:
-        _TF_MONO["gen"] = gen
-    ctxmax = (mx.get("tensorfold_health:context_length") if new else None) or vllm_ctxmax(port)
-    out = {
-        "tensorfold:records": reqs,
-        "tensorfold:prompt_total": prompt,
-        "tensorfold:cached_total": cached,
-    }
-    life = None if new else tf_lifetime()       # requests.jsonl is the jayleaton engine's: the newer kit does not write it
-    if life and life["n"]:
-        out.update({"tensorfold:all_in": float(life["in"]), "tensorfold:all_cached": float(life["cached"]),
-                    "tensorfold:all_out": float(life["out"]), "tensorfold:all_n": float(life["n"]),
-                    "tensorfold:all_since": float(life["since"] or 0)})
-    out.update({
-        "llamacpp:tokens_predicted_total": gen,
-        # only the COMPUTED tokens, like local_compute on vLLM: the cached cost no prefill
-        "llamacpp:prompt_tokens_total": max(0.0, prompt - cached),
-        "llamacpp:prompt_seconds_total": mx.get("tensorfold_health:prefill_seconds_total" if new else
-                                                "tensorfold_prefill_seconds_total", 0.0),
-        "llamacpp:requests_processing": inflight,
-        "llamacpp:requests_deferred": float((yzq or {}).get("high") or 0) + float((yzq or {}).get("low") or 0),
-        "llamacpp:n_tokens_max": float(ctxmax),
-        "llamacpp:spec_decode_num_drafts_total": rounds,
-        "llamacpp:spec_decode_num_accepted_tokens_total": max(0.0, comp - reqs - rounds),
-    })
-    if new and "tensorfold:mtp_drafted_total" in mx:
-        out.update({"tensorfold:has_drafted": 1.0,
-                    "llamacpp:spec_decode_num_draft_tokens_total": mx["tensorfold:mtp_drafted_total"],
-                    "llamacpp:spec_decode_num_accepted_tokens_total": mx.get("tensorfold:mtp_accepted_total", 0.0)})
-    rec = tf_last_from_counters(reqs, prompt, cached) if new else (tf_last_record() or {})
-    if new:
-        fill_n, fill_pos, fill_len = tf_fill(port)
-        out["tensorfold:fill_streams"] = float(fill_n)
-        if fill_len is not None:
-            out["tensorfold:fill_pos"], out["tensorfold:fill_len"] = float(fill_pos), float(fill_len)
-    slots = [{
-        "next_token": {"n_decoded": int(gen)},
-        # 0 ON PURPOSE, as for tabby: prefill is read from the closed counters (prompt/seconds), not from a progress.
-        # With the newer kit image y3 instead there is a real progress (tf_fill): the computed lines, monotone
-        "n_prompt_tokens_processed": int(_TF_FILL["done"]) if new else 0,
-        "n_prompt_tokens": int(rec.get("prompt") or 0),
-        "n_prompt_tokens_cache": int(rec.get("cached") or 0),
-        "n_ctx": int(ctxmax),
-        "is_processing": inflight > 0,
-    }]
-    return out, slots
-
-
-def tf_env(names=("glm53-flash-tf", "glm53-tf-r0")):
-    """The running rank-0 container's environment (GLM53_TF_* knobs on the jayleaton kit, TF_GLM_* on MiaAI's), via
-    docker: the process inside runs as root, so /proc/<pid>/environ is not readable from here."""
-    for name in names:
-        try:
-            out = subprocess.run(["docker", "inspect", "-f", "{{range .Config.Env}}{{println .}}{{end}}", name],
-                                 capture_output=True, text=True, timeout=5).stdout
-        except (OSError, subprocess.SubprocessError):
-            continue
-        if out.strip():
-            return dict(l.split("=", 1) for l in out.splitlines() if "=" in l)
-    return {}
-
-
-def server_info(port):
-    """Draft model, spec type, k and uptime from the process holding the port.
-    tmux and earlyoom lines are skipped: tmux carries an identical command line
-    (it is the wrapper) and earlyoom embeds 'llama-server' in its --prefer regex."""
-    info = {"draft": None, "spec": None, "k": None, "up": None, "model": None,
-            "engine": None}
-    try:
-        # -ww IS MANDATORY: without it ps truncates args= to $COLUMNS, and this
-        # panel sets COLUMNS itself for layout, so "--port N" fell off the end
-        # and the header silently lost the draft model and the uptime.
-        out = subprocess.run(["ps", "-ww", "-eo", "pid=,etimes=,args="],
-                             capture_output=True, text=True, timeout=4).stdout
-    except (OSError, subprocess.SubprocessError) as e:
-        if os.environ.get("SUZU_DEBUG"):
-            sys.stderr.write("suzu: ps failed: %r\n" % (e,))
-        return info
-    portpat = re.compile(r"(?:--port[= ]\s*|-p\s+)%d(?!\d)" % port)
-    best = fallback = None
-    for line in out.splitlines():
-        parts = line.strip().split(None, 2)
-        if len(parts) < 3:
-            continue
-        args = parts[2]
-        base = os.path.basename(args.split(None, 1)[0])
-        if base in ("tmux", "earlyoom", "sh", "bash", "grep"):
-            continue
-        if not any(b in base for b in ("llama-server", "ds4-server", "vllm", "python")):
-            continue
-        # "python" also matches the gateway and this very monitor: neither is an
-        # engine, and picking one would report ITS uptime as the model's. Exclude
-        # suzu by SCRIPT NAME, not path substring - the demo engine lives under a
-        # .../suzu/ directory and must still match - plus the gateway if
-        # --lanes-url points at one.
-        try:
-            script = os.path.basename(args.split(None, 1)[1].split()[0])
-        except IndexError:
-            script = ""
-        if script == "suzu.py" or (LANES_URL and _lanes_host() in args):
-            continue
-        if portpat.search(args):
-            best = (parts, args, base)
-            break
-        # The panel normally polls :30001, which is the GATEWAY - the engine
-        # itself listens on :30021 and its cmdline never carries the polled port,
-        # so the strict match found nothing and the header lost the draft model
-        # AND the uptime ("(no draft model)", "--:--", seen 23-08 with a dspark
-        # drafter plainly running). The launcher guarantees one engine at a time, so an
-        # engine process with the wrong port is still THE engine.
-        if fallback is None and any(
-                x in args for x in ("llama-server", "ds4-server", "vllm", "sglang", "tensorfold serve")):
-            fallback = (parts, args, base)
-        # TabbyAPI presents itself as `venv/bin/python .../tabby/main.py --config X`:
-        # none of the markers above. Without this branch the glm53x entry's header
-        # stayed without engine name and without uptime.
-        if fallback is None and "main.py" in args and "tabby" in args:
-            fallback = (parts, args, base)
-    if not best:
-        best = fallback
-    if not best:
-        if os.environ.get("SUZU_DEBUG"):
-            sys.stderr.write("suzu: no process on port %d among %d ps lines\n"
-                             % (port, len(out.splitlines())))
-        return info
-    parts, args, base = best
-    try:
-        info["up"] = int(parts[1])
-    except ValueError:
-        pass
-    info["pid"] = parts[0]
-    info["engine"] = base
-    # `python -m vllm.entrypoints...` is not a useful name in the header.
-    for nice in ("llama-server", "ds4-server", "vllm", "sglang"):
-        if nice in args:
-            info["engine"] = nice
-            break
-    if "tensorfold serve" in args:
-        # rank 0 of the TP=2 engine (glm53tf): inside the container, visible from the host's ps
-        info["engine"] = "tensorfold"
-        m = re.search(r"--drafter[= ]\s*(\S+)", args)
-        m_drafter = bool(m) and m.group(1) != "none"
-        if m:
-            d = re.search(r"models--([^/]+)--([^/]+)/snapshots/([0-9a-f]{7})", m.group(1))
-            info["draft"] = "%s/%s@%s" % d.groups() if d else os.path.basename(m.group(1).rstrip("/"))
-            info["spec"] = "DFlash2 + MTP + lookup, depth by cost"
-        else:
-            info["spec"] = "MTP, depth by cost"
-        for flag, key in (("--context", "maxlen"), ("--name", "model"), ("--tp", "tp")):
-            m = re.search(re.escape(flag) + r"[= ]\s*(\S+)", args)
-            if m:
-                info[key] = m.group(1)
-        if info.get("tp") == "2":
-            info["nnodes"] = "2"          # the two ranks live on this box and the rank-1 box
-        env = tf_env()
-        info["k"] = env.get("GLM53_TF_AUTO_FDRAFTS") or info["k"]
-        info["slots"] = env.get("GLM53_TF_BATCH")
-        info["kvdtype"] = env.get("GLM53_TF_KV_DTYPE")
-        info["quant"] = "EXL3 4bpw + q4 non-expert" if env.get("GLM53_TF_NONEXPERT") == "q4mse" else None
-        if "TF_GLM_DFLASH_POLICY" in env:                 # newer kit: other knobs, other names
-            pol = env["TF_GLM_DFLASH_POLICY"]
-            m = re.match(r"f\D*(\d+)", pol)
-            info["k"] = m.group(1) if m else info["k"]
-            copy = env.get("TF_GLM_COPY_DRAFTS") == "1"
-            info["spec"] = ("DFlash2 %s + copy drafts (up to %s)" % (pol, env.get("TF_GLM_COPY_MAX", "?")) if copy
-                            else "DFlash2 %s" % pol) if m_drafter else "MTP"
-            m = re.search(r"--parallel[= ]\s*(\d+)", args)
-            info["slots"] = m.group(1) if m else info["slots"]
-            info["kvdtype"] = env.get("TF_GLM_KV") or info["kvdtype"]
-            dense = env.get("TF_GLM_DENSE")
-            info["quant"] = "EXL3 4bpw + %s dense" % dense if dense else info["quant"]
-        return info
-    if "main.py" in args and "tabby" in args:
-        info["engine"] = "tabby/exl3"
-        # without the environment the header does not even know whether MTP is on
-        env = proc_env(parts[0])
-        info["spec"] = env.get("TABBY_DRAFT_MODEL_DRAFT_MODE") or info["spec"]
-        if info["spec"] and info["spec"] != "disabled":
-            info["draft"] = info["draft"] or "native MTP of the pack"
-        cache = env.get("TABBY_MODEL_CACHE_MODE")
-        if cache:
-            info["engine"] += " . cache " + cache
-    for flag, key in (("--spec-draft-model", "draft"), ("--spec-type", "spec"),
-                      ("--spec-draft-n-max", "k"), ("--model", "model"),
-                      ("--served-model-name", "model"),
-                      ("--quantization", "quant"), ("--kv-cache-dtype", "kvdtype"),
-                      ("--tensor-parallel-size", "tp"), ("--nnodes", "nnodes"),
-                      ("--max-num-seqs", "seqs"), ("--max-model-len", "maxlen")):
-        if info.get(key):
-            continue
-        m = re.search(re.escape(flag) + r"[= ]\s*(\S+)", args)
-        if m:
-            info[key] = m.group(1)
-    # vLLM does not take the llama.cpp flags: the whole speculative stack arrives
-    # as one JSON blob, so without this the panel says "no draft model" while
-    # dspark is demonstrably drafting (spec_decode_* counters moving).
-    m = re.search(r"--speculative[-_]config[= ]\s*(\{.*?\})(?:\s+--|\s*$)", args)
-    if m:
-        try:
-            sc = json.loads(m.group(1))
-        except (json.JSONDecodeError, ValueError):
-            sc = {}
-        if isinstance(sc, dict):
-            info["draft"] = info["draft"] or sc.get("model")
-            info["spec"] = info["spec"] or sc.get("method")
-            k = sc.get("num_speculative_tokens")
-            info["k"] = info["k"] or (str(k) if k is not None else None)
-    return info
-
-
-# -------------------------------------------------------------- log tail ---
-def active_log(llm):
-    try:
-        out = subprocess.run(["tmux", "list-sessions", "-F", "#{session_name}"],
-                             capture_output=True, text=True, timeout=3).stdout
-    except (OSError, subprocess.SubprocessError):
-        out = ""
-    cands = []
-    for s in (x for x in out.split() if x.startswith("yz-")):
-        p = os.path.join(llm, "yz-logs", "yz-%s.log" % s[3:])
-        if os.path.exists(p):
-            cands.append(p)
-    if not cands:
-        d = os.path.join(llm, "yz-logs")
-        if os.path.isdir(d):
-            cands = [os.path.join(d, f) for f in os.listdir(d) if f.endswith(".log")]
-    return max(cands, key=os.path.getmtime) if cands else None
-
-
-def log_mtime(llm):
-    """Wall-clock of the server's last log write. Used only to seed the idle
-    clock: a panel started five minutes ago must not claim the engine has been
-    idle for five minutes when the log says it has been quiet since 06:57."""
-    lp = active_log(llm)
-    try:
-        return os.path.getmtime(lp) if lp else None
-    except OSError:
-        return None
-
-
-def tail(path, n):
-    try:
-        with open(path, "rb") as f:
-            f.seek(0, os.SEEK_END)
-            size, data = f.tell(), b""
-            while size > 0 and data.count(b"\n") <= n + 2:
-                step = min(8192, size)
-                size -= step
-                f.seek(size)
-                data = f.read(step) + data
-        return [ANSI_RE.sub("", l).rstrip() for l in
-                data.decode("utf-8", "replace").splitlines()[-n:]]
-    except OSError:
+def _routed_indices(layer, step, n_experts, k):
+    """fade.rs routed_indices(): deterministic LCG spread, same constants."""
+    if n_experts == 0:
         return []
+    k = max(1, min(k, n_experts))
+    M = (1 << 64) - 1
+    x = ((layer * 0x9E3779B1) ^ (step * 0x85EBCA6B)) & M
+    out, guard = [], 0
+    while len(out) < k and guard < k * 8:
+        x = (x * 6364136223846793005 + 1442695040888963407) & M
+        e = (x >> 33) % n_experts
+        if e not in out:
+            out.append(e)
+        guard += 1
+    return out
 
 
-# ------------------------------------------------- model architecture ----
-def model_config_path():
-    """Host path to the running engine's model config.json.
 
-    The layer grid is built from the REAL model topology (num layers, experts,
-    DSpark target layers, KV compression ratios) - not a hard-coded table. The
-    engine is a docker container; the config lives in the /models mount. Falls
-    back to scanning ~/models for the most recent tp1/config.json.
-    """
-    try:
-        names = subprocess.run(["docker", "ps", "--format", "{{.Names}}"],
-                               capture_output=True, text=True, timeout=8).stdout.split()
-        # TensorFold (glm53mia, glm53tf: 05-10): `tensorfold serve <model folder>` inside the container, the folder
-        # under the HF cache mount. Without this the expert heat map had no topology on TensorFold and vanished
-        # once the old tp1/ folders of the vLLM kit were gone from ~/models.
-        for n in names:
-            try:
-                out = subprocess.run(["docker", "inspect", "-f", "{{json .Config.Cmd}}\t{{json .Mounts}}", n],
-                                     capture_output=True, text=True, timeout=8).stdout
-                cmd_j, mounts_j = out.rstrip("\n").split("\t", 1)
-                cmd, mounts = json.loads(cmd_j) or [], json.loads(mounts_j) or []
-            except (ValueError, OSError, subprocess.SubprocessError):
-                continue
-            if "serve" not in cmd or not any("tensorfold" in str(c) for c in cmd[:2]):
-                continue
-            model = cmd[cmd.index("serve") + 1] if cmd.index("serve") + 1 < len(cmd) else ""
-            for mnt in mounts:
-                dst = (mnt.get("Destination") or "").rstrip("/")
-                if dst and model.startswith(dst + "/"):
-                    p = os.path.join(mnt.get("Source") or "", model[len(dst) + 1:], "config.json")
-                    if os.path.exists(p):
-                        return p
-        for n in names:
-            if not any(t in n for t in ("vllm", "spark", "sglang")):
-                continue
-            mounts = subprocess.run(
-                ["docker", "inspect", "-f",
-                 "{{range .Mounts}}{{.Source}}|{{.Destination}} {{end}}", n],
-                capture_output=True, text=True, timeout=8).stdout
-            for part in mounts.split():
-                if "|" not in part:
-                    continue
-                src, dst = part.split("|", 1)
-                dst = dst.rstrip("/")
-                if dst == "/models":
-                    p = os.path.join(src, "tp1", "config.json")
-                    if os.path.exists(p):
-                        return p
-    except (OSError, subprocess.SubprocessError):
-        pass
-    # fallback: the most recent tp1 config in ~/models
-    cands = []
-    mdir = os.path.expanduser("~/models")
-    try:
-        for root, dirs, files in os.walk(mdir):
-            if root.endswith(os.sep + "tp1") and "config.json" in files:
-                cands.append(os.path.join(root, "config.json"))
-    except OSError:
-        pass
-    return max(cands, key=os.path.getmtime) if cands else None
-
-
-def load_model_arch(path):
-    """Extract the per-layer topology from a model config.json.
-
-    Returns None on any failure; the layer grid degrades to a message instead
-    of a crash. Everything here is static model structure - the LIVE work
-    colours come from the Sample, never from this table.
-    """
-    try:
-        with open(path) as f:
-            c = json.load(f)
-    except (OSError, ValueError):
-        return None
-    if isinstance(c.get("text_config"), dict):      # GLM-5.3 (glm5_next): the text model's fields live here
-        top, c = c, dict(c["text_config"])
-        if not c.get("vision_n_layers"):
-            c["vision_n_layers"] = (top.get("vision_config") or {}).get("depth") or 0
-        kinds = c.get("mlp_layer_types") or []
-        if kinds and not c.get("hybrid_tr3_tail"):
-            c["hybrid_tr3_tail"] = {"moe_layers": [i for i, k in enumerate(kinds) if k == "sparse"]}
-    n = int(c.get("num_hidden_layers") or 0)
-    if n <= 0:
-        return None
-    comp = c.get("compress_ratios") or []
-    comp = {i: int(v) for i, v in enumerate(comp)}
-    return {
-        "n": n,
-        "experts": int(c.get("n_routed_experts") or 0),
-        "topk": int(c.get("num_experts_per_tok") or 0),
-        "shared": int(c.get("n_shared_experts") or 0),
-        "nextn": int(c.get("num_nextn_predict_layers") or 0),
-        "vision": int(c.get("vision_n_layers") or 0),
-        "target": [int(x) for x in (c.get("dspark_target_layer_ids") or [])],
-        "compress": comp,
-        "moe_layers": (c.get("hybrid_tr3_tail") or {}).get("moe_layers"),
-        "name": os.path.basename(os.path.dirname(os.path.dirname(path))),
-    }
-
-
-# ---------------------------------------------------------------- render ---
-class View:
-    # Layout breakpoints. At/above WIDE the two panel columns sit side by side;
-    # below that they stack. Below NARROW the number grid drops from 3 columns to
-    # 1. A terminal gets resized far more often than this tool gets restarted, so
-    # every panel is rebuilt from the current size on every frame - nothing is
-    # cached per width.
+class CoreMixin:
     WIDE = 118
     NARROW = 76
+    FADE_ATTACK = 0.65
+    FADE_RELEASE = 0.12
 
     def __init__(self, port, interval, show_log, theme="neon"):
         self.port, self.interval, self.show_log = port, interval, show_log
@@ -2049,42 +2338,51 @@ class View:
         self.memory = None               # /proc memory picture (fetch_memory)
         self.h_ttft = deque(maxlen=120)  # time-to-first-token per request, s
 
+
+
     def cycle_theme(self, step=1):
         i = (THEME_ORDER.index(self.t.name) + step) % len(THEME_ORDER)
         self.t = Theme(THEME_ORDER[i])
         _theme_save(self.t.name)   # remember it for the next run
         return self.t.name
 
-    # ---------------------------------------------- ramp family (color fix)
+
+
     def ramps(self):
         """The RGB ramp set for the active theme: gold family for the limone
         themes, the upstream ocean ramps otherwise."""
+        if self.t.name in PHOSPHOR_FAMILY:
+            return HEAT_PHOS, VU_PHOS, FLOW_PHOS, TRACK_BG_PHOS
         if self.t.name in GOLD_FAMILY:
             return HEAT_GOLD, VU_GOLD, FLOW_GOLD, TRACK_BG_GOLD
         return HEAT_COOL, VU_COOL, FLOW_COOL, TRACK_BG_COOL
 
+
+
     def ramp_heat(self, v):
         return _col(_grad(self.ramps()[0], v))
+
+
 
     def ramp_heat_bg(self, v):
         return _bg_col(_grad(self.ramps()[0], v))
 
+
+
     def ramp_vu(self, v):
         return _col(_grad(self.ramps()[1], v))
+
+
 
     def ramp_flow(self, v):
         return _col(_grad(self.ramps()[2], v))
 
+
+
     def ramp_track(self):
         return self.ramps()[3]
 
-    # ---------------------------------------------------- fade (llm-visuals)
-    # llm-visuals CONTRIBUTING rule: "smooth not flicker". Cells hold a heat
-    # value that ATTACKS fast when the layer works and RELEASES slowly when it
-    # stops, so a bursty speculative stream glows instead of strobing. The
-    # default release (~2.5 s to fade out) is tuned for a 1 s poll interval.
-    FADE_ATTACK = 0.65
-    FADE_RELEASE = 0.12
+
 
     def fade_dt(self):
         """One shared dt per frame - call once, pass to every fade_step."""
@@ -2092,6 +2390,8 @@ class View:
         dt = now - self._fade_dt if now > self._fade_dt else 0.25
         self._fade_dt = now
         return dt
+
+
 
     def fade_step(self, key, hot, dt):
         """Advance one heat cell; returns its heat 0..1 (0 = cold)."""
@@ -2105,6 +2405,8 @@ class View:
             return 0.0
         self.fade[key] = v
         return v
+
+
 
     def expert_deltas(self):
         """Real routing from TensorFold's GET /experts (patches/0990: glm53tf, glm53mia y9+): per layer, how many times each expert was
@@ -2137,6 +2439,8 @@ class View:
             return None
         st["delta"] = [[max(0, a - b) for a, b in zip(r, q)] for r, q in zip(cnt, prev)]
         return st["delta"]
+
+
 
     def fade_experts(self, arch, working, dt, token_step):
         """fade.rs expert heat: routed expert jumps to 1.0, cools with a
@@ -2171,420 +2475,18 @@ class View:
                 for e in _routed_indices(l, int(token_step), n_e, k):
                     row[e] = 1.0
 
-    # ------------------------------------------------------------ widgets
-    def bar(self, frac, width, color=None, invert=False):
-        """Gradient bar: every cell is painted by ITS OWN position on the ramp.
 
-        That is the point. A flat bar says "some amount"; a graded one says
-        which band you are in without reading the number, because the colour
-        breaks under your eye at the same cutoffs heat() uses. Pass color= to
-        force one flat colour (where the hue already means something else).
-        invert=True for metrics where high is BAD, e.g. a full kv cache.
-        """
-        frac = max(0.0, min(1.0, frac))
-        width = max(0, width)
-        quarters = int(round(frac * width * 4))           # dithered edge: a cell in quarters, ░ ▒ ▓ then █
-        fill, edge = divmod(quarters, 4)
-        if fill >= width:
-            fill, edge = width, 0
-        t = self.t
-        if t.plain:
-            return "█" * fill + (DITHER[edge] if edge else "") + "░" * (width - fill - (1 if edge else 0))
-        if color is not None:
-            body = color + "█" * fill + (DITHER[edge] if edge else "")
-        else:
-            out, last = [], None
-            for i in range(fill + (1 if edge else 0)):
-                # centre of the cell, so a 1-cell bar is not pinned at 0.0
-                pos = (i + 0.5) / width
-                col = t.heat(1.0 - pos if invert else pos)
-                if col != last:
-                    out.append(col)
-                    last = col
-                out.append("█" if i < fill else DITHER[edge])
-            body = "".join(out)
-        return body + t.frame + "░" * (width - fill - (1 if edge else 0)) + RST
 
-    def spark(self, series, width):
-        t = self.t
-        if width <= 0:
-            return ""
-        if not series:
-            return ("." * width) if t.plain else (t.frame + "·" * width + t.rst())
-        s = list(series)[-width:]
-        lo, hi = min(s), max(s)
-        span = (hi - lo) or 1.0
-        out = []
-        for v in s:
-            idx = min(len(BLOCKS) - 1, int((v - lo) / span * (len(BLOCKS) - 1) + 0.5))
-            ch = BLOCKS[idx]
-            # llm-visuals flow ramp by level: violet -> cyan -> white (or the
-            # gold family on the limone themes)
-            out.append(ch if t.plain
-                       else self.ramp_flow(v / hi if hi else 0.0) + ch)
-        rest = max(0, width - len(s))
-        tailpad = ("." if t.plain else "·") * rest
-        return ("".join(out) + t.rst()
-                + ((t.frame + tailpad + t.rst()) if rest else ""))
-
-    def box(self, title, body, width, color=None):
-        t = self.t
-        color = color if color is not None else t.head
-        if width < 12:                      # too narrow to frame - print bare
-            return [clip(b, width) for b in body]
-        lab = " %s%s%s " % (color, title, t.rst())
-        lab = clip(lab, max(4, width - 4))
-        top = (t.frame + "┌─" + t.rst() + lab + t.frame
-               + "─" * max(0, width - vis_len(lab) - 3) + "┐" + t.rst())
-        rows = [top]
-        for ln in body:
-            rows.append(t.frame + "│" + t.rst()
-                        + pad(clip(ln, width - 2), width - 2)
-                        + t.frame + "│" + t.rst())
-        rows.append(t.frame + "└" + "─" * (width - 2) + "┘" + t.rst())
-        return rows
-
-    def pct(self, frac, rw=10, good_high=False):
-        """good_high: a high prefix-cache rate is GOOD, a full KV cache is BAD."""
-        t = self.t
-        if frac is None:
-            return t.frame + "n/a" + t.rst()
-        w = max(4, min(14, rw))
-        # the NUMBER keeps the flat verdict colour; the BAR is graded, and on a
-        # metric where high is bad the gradient runs the other way round
-        col = t.heat(frac) if good_high else t.heat(1.0 - frac)
-        return "%s %s%3.0f%%%s" % (self.bar(frac, w, invert=not good_high),
-                                   col, frac * 100, t.rst())
-
-    def hrow(self, label, series, sw, fmt, col, note, lw=12, fit=None):
-        """fit: the row's inner width; the sparkline then gets exactly what the label, value, range and note leave."""
-        t = self.t
-        cur = series[-1] if series else 0.0
-        rng = ("%s%s-%s%s" % (t.frame, fmt % min(series), fmt % max(series), t.rst())
-               if series else t.frame + "-" + t.rst())
-        tailtxt = (" %s%s%s" % (t.frame, note, t.rst())) if note else ""
-        if fit:
-            sw = max(4, fit - lw - 3 - vis_len(fmt % cur) - vis_len(rng) - vis_len(tailtxt))
-        return ("%s%-*s%s %s %s%s%s %s%s"
-                % (t.label, lw, label, t.rst(), self.spark(series, sw),
-                   col + t.bold(), fmt % cur, t.rst(), rng, tailtxt))
-
-    # ------------------------------------------------- widgets (llm-visuals)
-    def big_digits(self, value, width, color, fmt="%.1f"):
-        """llm-visuals big_digits(): 3-row half-block numerals, glyph shapes
-        copied verbatim from src/render.rs. Falls back to plain text when the
-        art does not fit the width."""
-        txt = fmt % value
-        rows = ["", "", ""]
-        for i, ch in enumerate(txt):
-            g = BIG_GLYPHS.get(ch)
-            if g is None:
-                continue
-            for r in range(3):
-                if i > 0:
-                    rows[r] += " "
-                rows[r] += g[r]
-        rows = [r.rstrip() for r in rows]
-        if max(len(r) for r in rows) > width:
-            return [color + txt + (RST if color else "")]
-        end = RST if color else ""
-        return [color + r + end for r in rows]
-
-    def gauge(self, frac, width, peak=None):
-        """llm-visuals gauge(): half-cell precision, VU ramp by position
-        (green -> amber -> red), white peak-hold notch on a visible track."""
-        frac = max(0.0, min(1.0, frac))
-        t = self.t
-        if t.plain:
-            return self.bar(frac, width)
-        halves = int(round(frac * width * 2))
-        peak_idx = (min(width - 1, int(max(0.0, min(1.0, peak)) * width))
-                    if peak is not None else None)
-        col = self.ramp_track()
-        out = []
-        for x in range(width):
-            pos = (x + 0.5) / max(1, width)
-            filled = max(0, min(2, halves - x * 2))
-            if peak_idx == x and filled < 2:
-                out.append(_col(WHITE_FG) + _bg_col(col) + "▌" + RST)
-            elif filled == 2:
-                out.append(self.ramp_vu(pos) + "█" + RST)
-            elif filled == 1:
-                out.append(self.ramp_vu(pos) + _bg_col(col) + "▒" + RST)
-            else:
-                out.append(_col(col) + "█" + RST)
-        return "".join(out)
-
-    @staticmethod
-    def pulse_head(i):
-        return PULSE[i % len(PULSE)]
-
-    def cluster_title(self):
-        return "tensor-parallel cluster" if self.info.get("nnodes") in ("2", 2) else "gb10 . rank 0 + rank 1"
-
-    def cluster_panel(self, width):
-        """Both GB10s in one box, in aligned columns (05-10: "replace gpu . memory . gb10 with that"): this box
-        (rank 0 on the TP=2 cluster: GPU on the VU ramp, watts, clock, temperature, unified memory, the engine's rss)
-        and rank 1 (from Rank1Feed's HTTP poller: same columns, plus how fresh the sample is), then on the cluster
-        the link row: bytes/s through this box's RoCE functions (roce_link: every round's all-gathers, so it moves
-        with decode and prefill) and whether the pair is in step (rank 0's /health iteration_s: a stalled pair keeps
-        growing it). On a single-node engine the same two box rows, no link, and an explicit UNREACHABLE when rank 1
-        is asleep."""
-        cluster = self.info.get("nnodes") in ("2", 2)
-        t = self.t
-        r1 = self.rank1 or {"up": None, "telemetry": "connecting"}
-        inner = width - 2
-        gw = max(8, min(32, (inner - 118) // 2 + 8))
-        narrow = inner < 110
-
-        def name(rank, box):
-            return pad("%s%s%s  %s%s%s" % (t.head, rank, t.rst(), t.label, box, t.rst()), 14) if cluster \
-                else pad("%s%s%s" % (t.label, box, t.rst()), 6)
-
-        def gpu_cols(gp):
-            if not gp:
-                return pad("%sGPU%s %s" % (t.label, t.rst(), t.dim() + "n/a" + t.rst()), 4 + gw + 5 + (0 if narrow else 22))
-            u = gp.get("util") or 0.0
-            core = "%sGPU%s %s %s%3.0f%%%s" % (t.label, t.rst(), self.gauge(u / 100.0, gw), t.value + t.bold(), u, t.rst())
-            if narrow:
-                return core
-            return core + "%s %4.0f W %5.0f MHz %3.0fC%s" % (t.frame, gp.get("w") or 0, gp.get("mhz") or 0,
-                                                           gp.get("c") or 0, t.rst())
-
-        def ram_cols(used_mb, total_mb, avail_mb):
-            if not total_mb:
-                return pad("", 28)
-            return pad("   %sRAM%s %3.0f/%3.0fG %s%4.1fG free%s"
-                       % (t.label, t.rst(), used_mb / 1024.0, total_mb / 1024.0, t.frame, (avail_mb or 0) / 1024.0,
-                          t.rst()), 28)
-
-        tel = r1.get("telemetry")
-        if tel == "no url":
-            tel_s = "%srank 1: --rank1-url not set%s" % (t.dim(), t.rst())
-        elif tel == "live":
-            tel_s = "%s%.1f s ago%s" % (t.frame, r1.get("age") or 0.0, t.rst())
-        elif tel == "stale":
-            tel_s = "%ssample stale %.0f s%s" % (t.heat(0.4), r1.get("age") or 0.0, t.rst())
-        elif tel == "unreachable":
-            tel_s = "%srank 1 unreachable%s" % (t.heat(0.1), t.rst())
-        else:
-            tel_s = "%sconnecting...%s" % (t.dim(), t.rst())
-        if r1.get("up") is False:
-            state = ("%sRANK 1 DOWN - decode will stall%s" if cluster else "%sUNREACHABLE (asleep?)%s") % (t.heat(0.1), t.rst())
-        elif r1.get("up") is True:
-            cont = r1.get("container") or ""
-            # "glm53-flash-tf Up 52 minutes" -> "up 52 minutes": the name says nothing the row does not
-            st = cont.split(" ", 1)[1] if " " in cont else ""
-            state = "%s%s%s" % (t.heat(0.9), (st[:1].lower() + st[1:]) if st else "up", t.rst())
-        else:
-            state = ""
-        body = []
-        g0 = (self.gpu or [None])[0]
-        mem = self.memory or {}
-        tot, avail = (mem.get("total") or 0) / 1024.0, (mem.get("avail") or 0) / 1024.0
-        rss = ("%sengine rss %.1fG%s" % (t.frame, (mem.get("rss") or 0) / 1048576.0, t.rst())) if mem.get("rss") else ""
-        body.append(name("rank 0", "this box") + gpu_cols(g0) + ram_cols(tot - avail, tot, avail) + "   " + rss)
-        body.append(name("rank 1", "remote") + gpu_cols(r1.get("gpu"))
-                    + ram_cols(r1.get("ramUsedMb"), r1.get("ramTotalMb"), r1.get("availMb"))
-                    + "   " + "   ".join(x for x in (state, tel_s) if x))
-        if cluster:
-            tx, rx, pk, devs = roce_link()
-            if tx is None:
-                link = name("link", "CX7 ") + "%sNET%s %smeasuring...%s" % (t.label, t.rst(), t.dim(), t.rst())
-            else:
-                frac = (max(tx, rx) / pk) if pk else 0.0
-                link = (name("link", "CX7 ") + "%sNET%s %s %sout %9s/s  in %9s/s%s"
-                        % (t.label, t.rst(), self.gauge(frac, gw), t.value, si_bytes(tx), si_bytes(rx), t.rst()))
-                if not narrow:
-                    link += "   %speak %s/s . %s%s" % (t.frame, si_bytes(pk), "+".join(devs) or "no RoCE device", t.rst())
-            hl = _TF_HEALTH if getattr(self, "tf", False) else {"at": None}
-            if hl.get("at") is not None and time.monotonic() - hl["at"] < 10:
-                it = hl.get("iteration_s") or 0.0
-                if hl.get("ok") is False or hl.get("fatal"):
-                    link += "   %sENGINE FATAL - restart both ranks%s" % (t.heat(0.05), t.rst())
-                elif it >= 30:
-                    link += "   %sSTALLED: iteration running %.0f s (ranks out of step?)%s" % (t.heat(0.1), it, t.rst())
-                else:
-                    link += "   %sin step%s %s(iteration %.1f s)%s" % (t.heat(0.9), t.rst(), t.frame, it, t.rst())
-            body.append(link)
-            if r1.get("run") is not None or r1.get("kv") is not None:      # the vLLM cluster's rank-1 /metrics
-                bits = []
-                if r1.get("run") is not None:
-                    bits.append("req %d" % r1["run"])
-                if r1.get("kv") is not None:
-                    bits.append("kv %.0f%%" % (r1["kv"] * 100))
-                if r1.get("gen") is not None:
-                    bits.append("gen %s tok" % human(r1["gen"]))
-                if r1.get("prompt") is not None:
-                    bits.append("prompt %s tok" % human(r1["prompt"]))
-                body.append(pad("", 14) + "%srank 1 worker: %s%s" % (t.frame, " . ".join(bits), t.rst()))
-        return [clip(x, inner) for x in body]
-
-    def lanes_panel(self, cur, width):
-        """The optional gateway, the thing no upstream dashboard has: the
-        two-lane queue that decides what reaches the engine, and the preemption
-        machinery that protects the human's lane."""
-        q, l = self.yzq, self.lanes
-        if not q and not l:
-            if LANES_URL:
-                t = self.t
-                return [clip("%sno lanes endpoint%s" % (t.frame, t.rst()), width - 2)]
-            return None
-        t = self.t
-        hi = int((q or {}).get("high") or 0)
-        lo = int((q or {}).get("low") or 0)
-        par = int((q or {}).get("parallel") or 1)
-        run = len((q or {}).get("running") or [])
-        rl = [{"alta": "high", "bassa": "low"}.get(r.get("prio"), r.get("prio")) for r in ((q or {}).get("running") or [])]
-        inf = ("high %d . low %d" % (rl.count("high"), rl.count("low"))) if rl else "-"   # 05-10: every running request, not the oldest
-        free = (l or {}).get("free_slots")
-        bits = ["%shigh%s %d queued . running %d/%d (%s)"
-                % (t.head, t.rst(), hi, run, par, inf),
-                "%slow %s %d queued" % (t.accent, t.rst(), lo)]
-        if free is not None:
-            bits.append("free slots %s" % free)
-        for k, lab in (("beat_refused", "beat refused"),
-                       ("beat_kill", "beat killed")):
-            v = (q or {}).get(k)
-            if v:
-                bits.append("%s %s%d%s" % (lab, t.heat(0.3), int(v), t.rst()))
-        return [clip(" . ".join(bits), width - 2)]
-
-    def model_strip(self, width):
-        """One line of what is actually loaded - the repo's model strip,
-        reduced to the one model this box serves. Facts come from the engine
-        cmdline, not from a config file that can rot."""
-        i = self.info
-        if not i.get("model") and not i.get("engine"):
-            return None
-        bits = []
-        model = (i.get("model") or "?").split("/")[-1]
-        bits.append(model)
-        if i.get("quant"):
-            bits.append(str(i["quant"]))
-        if i.get("kvdtype"):
-            bits.append("kv " + str(i["kvdtype"]))
-        if i.get("tp"):
-            bits.append("TP %s" % i["tp"])
-        if i.get("seqs"):
-            bits.append("seqs %s" % i["seqs"])
-        if i.get("maxlen"):
-            bits.append("ctx %s" % human(float(i["maxlen"])))
-        if i.get("spec"):
-            bits.append("%s k=%s" % (i["spec"], i.get("k") or "?"))
-        t = self.t
-        line = "  %s>%s %s%s%s" % (t.head, t.rst(), t.value,
-                                   " . ".join(bits), t.rst())
-        return [clip(line, width - 2)] if bits else None
-
-    def vmeter(self, frac, hold, height, width):
-        """Vertical VU strip, rows top to bottom: eighth-block precision, ramp
-        colour by height, white peak-hold line that sits then falls (the
-        repo's vmeter, on our ramps)."""
-        t = self.t
-        height = max(1, height)
-        frac = max(0.0, min(1.0, frac))
-        hold = max(0.0, min(1.0, hold))
-        if t.plain:
-            fill = int(round(frac * height))
-            return ["█" * width if r >= height - fill else "░" * width
-                    for r in range(height)]
-        total = int(round(frac * height * 8))
-        hold_row = None
-        if hold > frac + 1e-3:
-            cell = min(height - 1, max(0, int(hold * height * 0.999)))
-            hold_row = height - 1 - cell
-        rows = []
-        for r in range(height):
-            from_bottom = height - 1 - r
-            e = max(0, min(8, total - from_bottom * 8))
-            col = self.ramp_vu((from_bottom + 0.5) / height)
-            if hold_row == r and e < 8:
-                rows.append(_col(WHITE_FG) + "▔" * width + RST)
-            elif e == 8:
-                rows.append(col + "█" * width + RST)
-            elif e == 0:
-                rows.append(" " * width)
-            else:
-                rows.append(col + BLOCKS[e - 1] * width + RST)
-        return rows
-
-    def expert_grid(self, width, rows_avail=6, hot_fn=None):
-        """Port of render.rs render_experts(): the expert heatmap.
-
-        One block per group of experts per layer row; block heat = hottest
-        expert in the group; two layers share a row through the ▀ half block
-        (fg = upper layer, bg = lower layer), exactly as upstream. Colour is
-        the HEAT ramp by TIME since routed - white now, cooling to dark.
-        Identities come from the same deterministic stand-in router as
-        fade.rs (real routing needs the server /experts patch), and the
-        title says `simulated`, like the repo.
-        """
-        t = self.t
-        arch = self.model_arch()
-        if not arch:
-            return []
-        n_l = len(self.fade_expert) or arch["n"]                    # fade_experts sized it (MTP row included)
-        n_e = len(self.fade_expert[0]) if self.fade_expert and self.fade_expert[0] else min(arch["experts"], 256)
-        w = max(8, width - 2)
-        cols = max(1, w - 4)                 # 4 cells for the layer label
-        per_block = max(1, (n_e + cols - 1) // cols)
-        n_blocks = max(1, (n_e + per_block - 1) // per_block)
-        bw = max(1, min(4, cols // n_blocks))
-        gap = 1 if (bw >= 2 and (bw + 1) * n_blocks <= cols) else 0
-        rows_avail = max(1, rows_avail)
-        layers_per_slot = 1 if n_l <= rows_avail \
-            else max(1, (n_l + 2 * rows_avail - 1) // (2 * rows_avail))
-        half = n_l > rows_avail       # was `layers_per_slot > 1`: 46 layers in 23 rows has lps 1 and showed 0-22 only
-        n_slots = (n_l + layers_per_slot - 1) // layers_per_slot
-        text_rows = (n_slots + 1) // 2 if half else n_slots
-
-        def heat(slot, b):
-            l0 = slot * layers_per_slot
-            l1 = min(l0 + layers_per_slot, n_l)
-            e0 = b * per_block
-            e1 = min(e0 + per_block, n_e)
-            m = 0.0
-            for l in range(l0, l1):
-                row = self.fade_expert[l] if l < len(self.fade_expert) else None
-                if not row:
-                    continue
-                for e in range(e0, e1):
-                    if e < len(row) and row[e] > m:
-                        m = row[e]
-            return m
-
-        body = []
-        for r in range(min(text_rows, rows_avail)):
-            top = r * 2 if half else r
-            bot = top + 1
-            lab = "%3d " % (top * layers_per_slot)
-            cells = [lab] if t.plain else [t.frame + lab + t.rst()]
-            for b in range(n_blocks):
-                ht = heat(top, b)
-                if t.plain:
-                    cells.append(" .:-=+*#%@"[min(9, int(ht * 9.999))]
-                                 * bw if ht > 0 else " " * bw)
-                elif half:
-                    hb = heat(bot, b) if bot < n_slots else 0.0
-                    cells.append(self.ramp_heat(ht)
-                                 + self.ramp_heat_bg(hb) + "▀" * bw + RST)
-                else:
-                    cells.append(self.ramp_heat_bg(ht) + " " * bw + RST)
-                if gap and b + 1 < n_blocks:
-                    cells.append(" ")
-            body.append(clip("".join(cells), width - 2))
-        return body
-
-    # --------------------------------------------------------------- data
     def refresh_info(self):
         if time.time() - self.info_at > 20:
             self.info = server_info(self.port)
             self.info_at = time.time()
 
+
+
     def step(self):
         self.yzq = fetch_yzq(self.port)
-        self.lanes = fetch_yzq_lanes(self.port, LANES_URL) if LANES_URL else None
+        self.lanes = fetch_yzq_lanes(self.port, config.LANES_URL) if config.LANES_URL else None
         self.gpu = fetch_gpu()
         self.memory = fetch_memory(pid=self.info.get("pid"))
         # Rank-1 probe: fetch_rank1 caches for 10 s, so this is polite
@@ -2732,21 +2634,477 @@ class View:
                 self.pk_pf = max(live["pf"], self.pk_pf - 0.02 * self.pk_pf)
         return cur, live
 
-    @staticmethod
-    def sh_num(n):
-        """Short units for the totals boxes: 3.4M, 1.1G, 980k."""
-        n = float(n or 0)
-        for div, suf in ((1e9, "G"), (1e6, "M"), (1e3, "k")):
-            if n >= div:
-                return "%.1f%s" % (n / div, suf)
-        return "%d" % n
 
-    def totals_rows(self, cur, hermes=True):
-        """Every token the engine has handled since it started: prompt in (and how much of it came from cache),
-        generated out, requests. Short units: the box is ~44 columns. hermes=False drops the harness rows
-        (the btop-style engine-box shrink uses that to reclaim rows on a short terminal)."""
+
+    @staticmethod
+    def mean(seq):
+        return sum(seq) / len(seq) if seq else 0.0
+
+
+
+    @staticmethod
+    def wmean(seq):
+        """sum(numerators)/sum(denominators) over the window - the rate itself,
+        not the mean of the per-tick rates."""
+        num = sum(a for a, _ in seq)
+        den = sum(b for _, b in seq)
+        return num / den if den else 0.0
+
+# ==================== suzu/render/widgets.py
+"""Drawing primitives: bars, sparks, boxes, gauges, big digits."""
+
+
+
+class WidgetsMixin:
+    def bar(self, frac, width, color=None, invert=False):
+        """Gradient bar: every cell is painted by ITS OWN position on the ramp.
+
+        That is the point. A flat bar says "some amount"; a graded one says
+        which band you are in without reading the number, because the colour
+        breaks under your eye at the same cutoffs heat() uses. Pass color= to
+        force one flat colour (where the hue already means something else).
+        invert=True for metrics where high is BAD, e.g. a full kv cache.
+        """
+        frac = max(0.0, min(1.0, frac))
+        width = max(0, width)
+        quarters = int(round(frac * width * 4))           # dithered edge: a cell in quarters, ░ ▒ ▓ then █
+        fill, edge = divmod(quarters, 4)
+        if fill >= width:
+            fill, edge = width, 0
         t = self.t
-        sh = self.sh_num
+        if t.plain:
+            return "█" * fill + (DITHER[edge] if edge else "") + "░" * (width - fill - (1 if edge else 0))
+        if color is not None:
+            body = color + "█" * fill + (DITHER[edge] if edge else "")
+        else:
+            out, last = [], None
+            for i in range(fill + (1 if edge else 0)):
+                # centre of the cell, so a 1-cell bar is not pinned at 0.0
+                pos = (i + 0.5) / width
+                col = t.heat(1.0 - pos if invert else pos)
+                if col != last:
+                    out.append(col)
+                    last = col
+                out.append("█" if i < fill else DITHER[edge])
+            body = "".join(out)
+        return body + t.frame + "░" * (width - fill - (1 if edge else 0)) + RST
+
+
+
+    def spark(self, series, width):
+        t = self.t
+        if width <= 0:
+            return ""
+        if not series:
+            return ("." * width) if t.plain else (t.frame + "·" * width + t.rst())
+        s = list(series)[-width:]
+        lo, hi = min(s), max(s)
+        span = (hi - lo) or 1.0
+        out = []
+        for v in s:
+            idx = min(len(BLOCKS) - 1, int((v - lo) / span * (len(BLOCKS) - 1) + 0.5))
+            ch = BLOCKS[idx]
+            # llm-visuals flow ramp by level: violet -> cyan -> white (or the
+            # gold family on the limone themes)
+            out.append(ch if t.plain
+                       else self.ramp_flow(v / hi if hi else 0.0) + ch)
+        rest = max(0, width - len(s))
+        tailpad = ("." if t.plain else "·") * rest
+        return ("".join(out) + t.rst()
+                + ((t.frame + tailpad + t.rst()) if rest else ""))
+
+
+
+    def box(self, title, body, width, color=None):
+        t = self.t
+        color = color if color is not None else t.head
+        if width < 12:                      # too narrow to frame - print bare
+            return [clip(b, width) for b in body]
+        lab = " %s%s%s " % (color, title, t.rst())
+        lab = clip(lab, max(4, width - 4))
+        top = (t.frame + "┌─" + t.rst() + lab + t.frame
+               + "─" * max(0, width - vis_len(lab) - 3) + "┐" + t.rst())
+        rows = [top]
+        for ln in body:
+            rows.append(t.frame + "│" + t.rst()
+                        + pad(clip(ln, width - 2), width - 2)
+                        + t.frame + "│" + t.rst())
+        rows.append(t.frame + "└" + "─" * (width - 2) + "┘" + t.rst())
+        return rows
+
+
+
+    def pct(self, frac, rw=10, good_high=False):
+        """good_high: a high prefix-cache rate is GOOD, a full KV cache is BAD."""
+        t = self.t
+        if frac is None:
+            return t.frame + "n/a" + t.rst()
+        w = max(4, min(14, rw))
+        # the NUMBER keeps the flat verdict colour; the BAR is graded, and on a
+        # metric where high is bad the gradient runs the other way round
+        col = t.heat(frac) if good_high else t.heat(1.0 - frac)
+        return "%s %s%3.0f%%%s" % (self.bar(frac, w, invert=not good_high),
+                                   col, frac * 100, t.rst())
+
+
+
+    def hrow(self, label, series, sw, fmt, col, note, lw=12, fit=None):
+        """fit: the row's inner width; the sparkline then gets exactly what the label, value, range and note leave."""
+        t = self.t
+        cur = series[-1] if series else 0.0
+        rng = ("%s%s-%s%s" % (t.frame, fmt % min(series), fmt % max(series), t.rst())
+               if series else t.frame + "-" + t.rst())
+        tailtxt = (" %s%s%s" % (t.frame, note, t.rst())) if note else ""
+        if fit:
+            sw = max(4, fit - lw - 3 - vis_len(fmt % cur) - vis_len(rng) - vis_len(tailtxt))
+        return ("%s%-*s%s %s %s%s%s %s%s"
+                % (t.label, lw, label, t.rst(), self.spark(series, sw),
+                   col + t.bold(), fmt % cur, t.rst(), rng, tailtxt))
+
+
+
+    def big_digits(self, value, width, color, fmt="%.1f"):
+        """llm-visuals big_digits(): 3-row half-block numerals, glyph shapes
+        copied verbatim from src/render.rs. Falls back to plain text when the
+        art does not fit the width."""
+        txt = fmt % value
+        rows = ["", "", ""]
+        for i, ch in enumerate(txt):
+            g = BIG_GLYPHS.get(ch)
+            if g is None:
+                continue
+            for r in range(3):
+                if i > 0:
+                    rows[r] += " "
+                rows[r] += g[r]
+        rows = [r.rstrip() for r in rows]
+        if max(len(r) for r in rows) > width:
+            return [color + txt + (RST if color else "")]
+        end = RST if color else ""
+        return [color + r + end for r in rows]
+
+
+
+    def gauge(self, frac, width, peak=None):
+        """llm-visuals gauge(): half-cell precision, VU ramp by position
+        (green -> amber -> red), white peak-hold notch on a visible track."""
+        frac = max(0.0, min(1.0, frac))
+        t = self.t
+        if t.plain:
+            return self.bar(frac, width)
+        halves = int(round(frac * width * 2))
+        peak_idx = (min(width - 1, int(max(0.0, min(1.0, peak)) * width))
+                    if peak is not None else None)
+        col = self.ramp_track()
+        out = []
+        for x in range(width):
+            pos = (x + 0.5) / max(1, width)
+            filled = max(0, min(2, halves - x * 2))
+            if peak_idx == x and filled < 2:
+                out.append(_col(WHITE_FG) + _bg_col(col) + "▌" + RST)
+            elif filled == 2:
+                out.append(self.ramp_vu(pos) + "█" + RST)
+            elif filled == 1:
+                out.append(self.ramp_vu(pos) + _bg_col(col) + "▒" + RST)
+            else:
+                out.append(_col(col) + "█" + RST)
+        return "".join(out)
+
+
+
+    @staticmethod
+    def pulse_head(i):
+        return PULSE[i % len(PULSE)]
+
+
+
+    def vmeter(self, frac, hold, height, width):
+        """Vertical VU strip, rows top to bottom: eighth-block precision, ramp
+        colour by height, white peak-hold line that sits then falls (the
+        repo's vmeter, on our ramps)."""
+        t = self.t
+        height = max(1, height)
+        frac = max(0.0, min(1.0, frac))
+        hold = max(0.0, min(1.0, hold))
+        if t.plain:
+            fill = int(round(frac * height))
+            return ["█" * width if r >= height - fill else "░" * width
+                    for r in range(height)]
+        total = int(round(frac * height * 8))
+        hold_row = None
+        if hold > frac + 1e-3:
+            cell = min(height - 1, max(0, int(hold * height * 0.999)))
+            hold_row = height - 1 - cell
+        rows = []
+        for r in range(height):
+            from_bottom = height - 1 - r
+            e = max(0, min(8, total - from_bottom * 8))
+            col = self.ramp_vu((from_bottom + 0.5) / height)
+            if hold_row == r and e < 8:
+                rows.append(_col(WHITE_FG) + "▔" * width + RST)
+            elif e == 8:
+                rows.append(col + "█" * width + RST)
+            elif e == 0:
+                rows.append(" " * width)
+            else:
+                rows.append(col + BLOCKS[e - 1] * width + RST)
+        return rows
+
+# ==================== suzu/render/panels.py
+"""Panel builders: cluster, lanes, model strip, experts, heatmap, slots."""
+
+
+
+class PanelsMixin:
+    MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+    WEEKDAYS = ("Mo", "Tu", "We", "Th", "Fr", "Sa", "Su")
+
+    def cluster_title(self):
+        return "tensor-parallel cluster" if self.info.get("nnodes") in ("2", 2) else "gb10 . rank 0 + rank 1"
+
+
+
+    def cluster_panel(self, width):
+        """Both GB10s in one box, in aligned columns (05-10: "replace gpu . memory . gb10 with that"): this box
+        (rank 0 on the TP=2 cluster: GPU on the VU ramp, watts, clock, temperature, unified memory, the engine's rss)
+        and rank 1 (from Rank1Feed's HTTP poller: same columns, plus how fresh the sample is), then on the cluster
+        the link row: bytes/s through this box's RoCE functions (roce_link: every round's all-gathers, so it moves
+        with decode and prefill) and whether the pair is in step (rank 0's /health iteration_s: a stalled pair keeps
+        growing it). On a single-node engine the same two box rows, no link, and an explicit UNREACHABLE when rank 1
+        is asleep."""
+        cluster = self.info.get("nnodes") in ("2", 2)
+        t = self.t
+        r1 = self.rank1 or {"up": None, "telemetry": "connecting"}
+        inner = width - 2
+        gw = max(8, min(32, (inner - 118) // 2 + 8))
+        narrow = inner < 110
+
+        def name(rank, box):
+            return pad("%s%s%s  %s%s%s" % (t.head, rank, t.rst(), t.label, box, t.rst()), 14) if cluster \
+                else pad("%s%s%s" % (t.label, box, t.rst()), 6)
+
+        def gpu_cols(gp):
+            if not gp:
+                return pad("%sGPU%s %s" % (t.label, t.rst(), t.dim() + "n/a" + t.rst()), 4 + gw + 5 + (0 if narrow else 22))
+            u = gp.get("util") or 0.0
+            core = "%sGPU%s %s %s%3.0f%%%s" % (t.label, t.rst(), self.gauge(u / 100.0, gw), t.value + t.bold(), u, t.rst())
+            if narrow:
+                return core
+            return core + "%s %4.0f W %5.0f MHz %3.0fC%s" % (t.frame, gp.get("w") or 0, gp.get("mhz") or 0,
+                                                           gp.get("c") or 0, t.rst())
+
+        def ram_cols(used_mb, total_mb, avail_mb):
+            if not total_mb:
+                return pad("", 28)
+            return pad("   %sRAM%s %3.0f/%3.0fG %s%4.1fG free%s"
+                       % (t.label, t.rst(), used_mb / 1024.0, total_mb / 1024.0, t.frame, (avail_mb or 0) / 1024.0,
+                          t.rst()), 28)
+
+        tel = r1.get("telemetry")
+        if tel == "no url":
+            tel_s = "%srank 1: --rank1-url not set%s" % (t.dim(), t.rst())
+        elif tel == "live":
+            tel_s = "%s%.1f s ago%s" % (t.frame, r1.get("age") or 0.0, t.rst())
+        elif tel == "stale":
+            tel_s = "%ssample stale %.0f s%s" % (t.heat(0.4), r1.get("age") or 0.0, t.rst())
+        elif tel == "unreachable":
+            tel_s = "%srank 1 unreachable%s" % (t.heat(0.1), t.rst())
+        else:
+            tel_s = "%sconnecting...%s" % (t.dim(), t.rst())
+        if r1.get("up") is False:
+            state = ("%sRANK 1 DOWN - decode will stall%s" if cluster else "%sUNREACHABLE (asleep?)%s") % (t.heat(0.1), t.rst())
+        elif r1.get("up") is True:
+            cont = r1.get("container") or ""
+            # "glm53-flash-tf Up 52 minutes" -> "up 52 minutes": the name says nothing the row does not
+            st = cont.split(" ", 1)[1] if " " in cont else ""
+            state = "%s%s%s" % (t.heat(0.9), (st[:1].lower() + st[1:]) if st else "up", t.rst())
+        else:
+            state = ""
+        body = []
+        g0 = (self.gpu or [None])[0]
+        mem = self.memory or {}
+        tot, avail = (mem.get("total") or 0) / 1024.0, (mem.get("avail") or 0) / 1024.0
+        rss = ("%sengine rss %.1fG%s" % (t.frame, (mem.get("rss") or 0) / 1048576.0, t.rst())) if mem.get("rss") else ""
+        body.append(name("rank 0", "this box") + gpu_cols(g0) + ram_cols(tot - avail, tot, avail) + "   " + rss)
+        body.append(name("rank 1", "remote") + gpu_cols(r1.get("gpu"))
+                    + ram_cols(r1.get("ramUsedMb"), r1.get("ramTotalMb"), r1.get("availMb"))
+                    + "   " + "   ".join(x for x in (state, tel_s) if x))
+        if cluster:
+            tx, rx, pk, devs = roce_link()
+            if tx is None:
+                link = name("link", "CX7 ") + "%sNET%s %smeasuring...%s" % (t.label, t.rst(), t.dim(), t.rst())
+            else:
+                frac = (max(tx, rx) / pk) if pk else 0.0
+                link = (name("link", "CX7 ") + "%sNET%s %s %sout %9s/s  in %9s/s%s"
+                        % (t.label, t.rst(), self.gauge(frac, gw), t.value, si_bytes(tx), si_bytes(rx), t.rst()))
+                if not narrow:
+                    link += "   %speak %s/s . %s%s" % (t.frame, si_bytes(pk), "+".join(devs) or "no RoCE device", t.rst())
+            hl = _TF_HEALTH if getattr(self, "tf", False) else {"at": None}
+            if hl.get("at") is not None and time.monotonic() - hl["at"] < 10:
+                it = hl.get("iteration_s") or 0.0
+                if hl.get("ok") is False or hl.get("fatal"):
+                    link += "   %sENGINE FATAL - restart both ranks%s" % (t.heat(0.05), t.rst())
+                elif it >= 30:
+                    link += "   %sSTALLED: iteration running %.0f s (ranks out of step?)%s" % (t.heat(0.1), it, t.rst())
+                else:
+                    link += "   %sin step%s %s(iteration %.1f s)%s" % (t.heat(0.9), t.rst(), t.frame, it, t.rst())
+            body.append(link)
+            if r1.get("run") is not None or r1.get("kv") is not None:      # the vLLM cluster's rank-1 /metrics
+                bits = []
+                if r1.get("run") is not None:
+                    bits.append("req %d" % r1["run"])
+                if r1.get("kv") is not None:
+                    bits.append("kv %.0f%%" % (r1["kv"] * 100))
+                if r1.get("gen") is not None:
+                    bits.append("gen %s tok" % human(r1["gen"]))
+                if r1.get("prompt") is not None:
+                    bits.append("prompt %s tok" % human(r1["prompt"]))
+                body.append(pad("", 14) + "%srank 1 worker: %s%s" % (t.frame, " . ".join(bits), t.rst()))
+        return [clip(x, inner) for x in body]
+
+
+
+    def lanes_panel(self, cur, width):
+        """The optional gateway, the thing no upstream dashboard has: the
+        two-lane queue that decides what reaches the engine, and the preemption
+        machinery that protects the human's lane."""
+        q, l = self.yzq, self.lanes
+        if not q and not l:
+            if config.LANES_URL:
+                t = self.t
+                return [clip("%sno lanes endpoint%s" % (t.frame, t.rst()), width - 2)]
+            return None
+        t = self.t
+        hi = int((q or {}).get("high") or 0)
+        lo = int((q or {}).get("low") or 0)
+        par = int((q or {}).get("parallel") or 1)
+        run = len((q or {}).get("running") or [])
+        rl = [{"alta": "high", "bassa": "low"}.get(r.get("prio"), r.get("prio")) for r in ((q or {}).get("running") or [])]
+        inf = ("high %d . low %d" % (rl.count("high"), rl.count("low"))) if rl else "-"   # 05-10: every running request, not the oldest
+        free = (l or {}).get("free_slots")
+        bits = ["%shigh%s %d queued . running %d/%d (%s)"
+                % (t.head, t.rst(), hi, run, par, inf),
+                "%slow %s %d queued" % (t.accent, t.rst(), lo)]
+        if free is not None:
+            bits.append("free slots %s" % free)
+        for k, lab in (("beat_refused", "beat refused"),
+                       ("beat_kill", "beat killed")):
+            v = (q or {}).get(k)
+            if v:
+                bits.append("%s %s%d%s" % (lab, t.heat(0.3), int(v), t.rst()))
+        return [clip(" . ".join(bits), width - 2)]
+
+
+
+    def model_strip(self, width):
+        """One line of what is actually loaded - the repo's model strip,
+        reduced to the one model this box serves. Facts come from the engine
+        cmdline, not from a config file that can rot."""
+        i = self.info
+        if not i.get("model") and not i.get("engine"):
+            return None
+        bits = []
+        model = (i.get("model") or "?").split("/")[-1]
+        bits.append(model)
+        if i.get("quant"):
+            bits.append(str(i["quant"]))
+        if i.get("kvdtype"):
+            bits.append("kv " + str(i["kvdtype"]))
+        if i.get("tp"):
+            bits.append("TP %s" % i["tp"])
+        if i.get("seqs"):
+            bits.append("seqs %s" % i["seqs"])
+        if i.get("maxlen"):
+            bits.append("ctx %s" % human(float(i["maxlen"])))
+        if i.get("spec"):
+            bits.append("%s k=%s" % (i["spec"], i.get("k") or "?"))
+        t = self.t
+        line = "  %s>%s %s%s%s" % (t.head, t.rst(), t.value,
+                                   " . ".join(bits), t.rst())
+        return [clip(line, width - 2)] if bits else None
+
+
+
+    def expert_grid(self, width, rows_avail=6, hot_fn=None):
+        """Port of render.rs render_experts(): the expert heatmap.
+
+        One block per group of experts per layer row; block heat = hottest
+        expert in the group; two layers share a row through the ▀ half block
+        (fg = upper layer, bg = lower layer), exactly as upstream. Colour is
+        the HEAT ramp by TIME since routed - white now, cooling to dark.
+        Identities come from the same deterministic stand-in router as
+        fade.rs (real routing needs the server /experts patch), and the
+        title says `simulated`, like the repo.
+        """
+        t = self.t
+        arch = self.model_arch()
+        if not arch:
+            return []
+        n_l = len(self.fade_expert) or arch["n"]                    # fade_experts sized it (MTP row included)
+        n_e = len(self.fade_expert[0]) if self.fade_expert and self.fade_expert[0] else min(arch["experts"], 256)
+        w = max(8, width - 2)
+        cols = max(1, w - 4)                 # 4 cells for the layer label
+        per_block = max(1, (n_e + cols - 1) // cols)
+        n_blocks = max(1, (n_e + per_block - 1) // per_block)
+        bw = max(1, min(4, cols // n_blocks))
+        gap = 1 if (bw >= 2 and (bw + 1) * n_blocks <= cols) else 0
+        rows_avail = max(1, rows_avail)
+        layers_per_slot = 1 if n_l <= rows_avail \
+            else max(1, (n_l + 2 * rows_avail - 1) // (2 * rows_avail))
+        half = n_l > rows_avail       # was `layers_per_slot > 1`: 46 layers in 23 rows has lps 1 and showed 0-22 only
+        n_slots = (n_l + layers_per_slot - 1) // layers_per_slot
+        text_rows = (n_slots + 1) // 2 if half else n_slots
+
+        def heat(slot, b):
+            l0 = slot * layers_per_slot
+            l1 = min(l0 + layers_per_slot, n_l)
+            e0 = b * per_block
+            e1 = min(e0 + per_block, n_e)
+            m = 0.0
+            for l in range(l0, l1):
+                row = self.fade_expert[l] if l < len(self.fade_expert) else None
+                if not row:
+                    continue
+                for e in range(e0, e1):
+                    if e < len(row) and row[e] > m:
+                        m = row[e]
+            return m
+
+        body = []
+        for r in range(min(text_rows, rows_avail)):
+            top = r * 2 if half else r
+            bot = top + 1
+            lab = "%3d " % (top * layers_per_slot)
+            cells = [lab] if t.plain else [t.frame + lab + t.rst()]
+            for b in range(n_blocks):
+                ht = heat(top, b)
+                if t.plain:
+                    cells.append(" .:-=+*#%@"[min(9, int(ht * 9.999))]
+                                 * bw if ht > 0 else " " * bw)
+                elif half:
+                    hb = heat(bot, b) if bot < n_slots else 0.0
+                    cells.append(self.ramp_heat(ht)
+                                 + self.ramp_heat_bg(hb) + "▀" * bw + RST)
+                else:
+                    cells.append(self.ramp_heat_bg(ht) + " " * bw + RST)
+                if gap and b + 1 < n_blocks:
+                    cells.append(" ")
+            body.append(clip("".join(cells), width - 2))
+        return body
+
+
+
+    def totals_rows(self, cur):
+        """Every token the engine has handled since it started: prompt in (and how much of it came from cache),
+        generated out, requests. Short units: the box is ~44 columns."""
+        t = self.t
+
+        def sh(n):
+            n = float(n or 0)
+            for div, suf in ((1e9, "G"), (1e6, "M"), (1e3, "k")):
+                if n >= div:
+                    return "%.1f%s" % (n / div, suf)
+            return "%d" % n
         reqs = (" . %d req" % cur.nreq) if cur.nreq is not None else ""
         out = "%s%-13s%s %s%s%s%s%s%s" % (t.label, "tokens out", t.rst(), t.value, sh(cur.gen), t.rst(),
                                           t.frame, reqs, t.rst())
@@ -2760,12 +3118,10 @@ class View:
             rows.append("%s%-13s%s %s%s in . %s out%s%s . %d req%s"
                         % (t.label, "since " + since, t.rst(), t.value, sh(cur.all_in), sh(cur.all_out), t.rst(),
                            t.frame, cur.all_n, t.rst()))
-        if hermes:
-            rows += self.hermes_rows(sh)
+        rows += self.hermes_rows(sh)
         return rows
 
-    MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
-    WEEKDAYS = ("Mo", "Tu", "We", "Th", "Fr", "Sa", "Su")
+
 
     @staticmethod
     def short(n):
@@ -2774,6 +3130,8 @@ class View:
             if n >= div:
                 return ("%.0f%s" if n / div >= 100 else "%.1f%s") % (n / div, suf)
         return "%d" % n
+
+
 
     def heat_stats(self, days, today):
         """The numbers next to the map, stacked: the best days in order, then today, the last 7 days, the mean of
@@ -2788,6 +3146,8 @@ class View:
                  ("avg/day", sum(active) / len(active) if active else 0.0, "%d active" % len(active)),
                  ("total", sum(active), "since " + md(min(days)))]
         return rows
+
+
 
     def heatmap_rows(self, width, days=None, today=None):
         """Generated tokens per day as squares, like GitHub's contributions: one column a week (Mo-Su top down), the
@@ -2853,6 +3213,8 @@ class View:
             rows += [t.label + c[:8] + t.rst() + t.value + c[8:] + t.rst() for c in cells]
         return rows
 
+
+
     def hermes_rows(self, sh, top=3):
         """The harness total over all the models it used (hermes_usage), and the top ones by tokens."""
         u = hermes_usage()
@@ -2869,10 +3231,14 @@ class View:
             rows.append("%s  %-24s%s %s%s in . %s out%s" % (t.frame, m[:24], t.rst(), t.value, sh(i + cr), sh(o), t.rst()))
         return rows
 
+
+
     @staticmethod
     def tf_frac(tau, k=7):
         """Tokens a round as a fraction of a full draft block (k drafts + the bonus token): only a colour scale."""
         return min(1.0, (tau + 1.0) / (max(1, k) + 1.0))
+
+
 
     def fill_row(self, cur):
         """TensorFold (newer kit): the prompts in prefill, with the longest one's progress if /health says so (y3)."""
@@ -2886,11 +3252,15 @@ class View:
                        t.heat(pos / ln), 100.0 * pos / ln, t.rst(), t.frame, int(n), t.rst()))
         return "%s%-13s%s %s%d stream%s" % (t.label, "prefill", t.rst(), t.heat(0.7), int(n), t.rst())
 
+
+
     def tf_line(self, tau, bw, k=7):
         t = self.t
         f = self.tf_frac(tau, k)
         return ("%s◆ TOKENS/ROUND%s %s  %s%.2f%s  %stau=%.2f/%d%s"
                 % (t.title, t.rst(), self.bar(f, bw), t.heat(f), tau + 1, t.rst(), t.label, tau, k, t.rst()))
+
+
 
     @staticmethod
     def verdict(alpha, tau):
@@ -2903,6 +3273,8 @@ class View:
         if alpha > 0:
             return "Poor", "the draft loses more than it wins - try a lower k"
         return "No speculation", "no draft model, or engine idle since boot"
+
+
 
     def waiting_row(self, cur):
         """What is actually outstanding, which /metrics cannot tell you.
@@ -2949,6 +3321,8 @@ class View:
             t.label, "waiting", t.rst(), col, n, t.rst(), t.frame, hi, lo, t.rst(), slots)
         return (row, eng) if eng else row
 
+
+
     def running_lane(self):
         """Which lane the engine is actually chewing on, or nothing if the
         gateway is not in front of it."""
@@ -2961,6 +3335,8 @@ class View:
         prio = (q.get("inflight") or {}).get("prio")
         return {"alta": "high", "bassa": "low"}.get(prio, prio)      # the gateway names its lanes in Italian
 
+
+
     def slot_panel(self, cur):
         out = {"kv": None, "prefix": None, "ctxtxt": "-", "stale": False}
         if not cur.nslots or not cur.nctx:
@@ -2970,7 +3346,108 @@ class View:
         out["ctxtxt"] = "%s / %s" % (human(cur.ptok), human(cur.nctx))
         return out
 
-    # -------------------------------------------------------------- frame
+
+
+    def model_arch(self):
+        """Cached per-layer topology of the running engine (or None)."""
+        now = time.time()
+        if self.arch is None and now >= getattr(self, "arch_retry", 0.0):
+            self.arch_path = model_config_path()
+            if self.arch_path:
+                self.arch = load_model_arch(self.arch_path)
+            if self.arch is None:
+                self.arch_retry = now + 30.0
+        return self.arch
+
+
+
+    def _engine_aux(self):
+        """(vision_active, weights_offloaded, kv_usage) from one /metrics read."""
+        try:
+            txt = http_get("http://127.0.0.1:%d/metrics" % self.port,
+                           timeout=2, tries=1)
+            if not txt:
+                return False, False, None
+            mx = parse_metrics(txt)
+            q = g(mx, "vllm:mm_cache_queries_total")
+            now = time.time()
+            vact = False
+            if q is not None:
+                if self.mm_prev is not None and q > self.mm_prev \
+                        and now - self.mm_t < 120:
+                    vact = True
+                self.mm_prev, self.mm_t = q, now
+            woff = bool(gl(mx, "vllm:engine_sleep_state",
+                           'sleep_state="weights_offloaded"'))
+            kv = g(mx, "vllm:kv_cache_usage_perc")
+            return vact, woff, kv
+        except Exception:
+            return False, False, None
+
+
+
+    def layer_panel(self, width, free):
+        """Layer-activity visualizer: the model's REAL topology as coloured boxes.
+
+        Read-only - it reads /metrics and the engine's config.json and never
+        touches the engine, so it cannot perturb the LLM's output. Each layer is
+        a coloured box; the colour encodes work: hot = actively computing,
+        dim = idle, and the DSpark target layers are painted by their
+        speculative-decoding acceptance. This is the panel that sits where the
+        log is inside the spec view (toggled with L), not a separate screen.
+        """
+        t = self.t
+        res = self.step()
+        if res is None:
+            return []
+        cur, live = res
+        arch = self.model_arch()
+        if not arch:
+            return [t.dim() + "  no model config found - layer topology unavailable"
+                    + t.rst()]
+        n = arch["n"]
+        target = set(arch["target"])
+        comp = arch["compress"]
+        working = cur.busy and live["gen"] > 0
+        alpha = cur.acc / cur.draft if cur.draft > 0 else 0.0
+        # text colour that stays readable on a coloured box: dark on bright bg
+        tcol = "" if t.plain else fg(0)
+        cells = []
+        for i in range(n):
+            if i in target:
+                heat = alpha if working else 0.0
+                mark = t.accent + "★" + t.rst()
+            else:
+                heat = 0.85 if working else 0.0
+                mark = ""
+            kv = comp.get(i)
+            kvmark = ("~" if kv and kv > 1 else "·" if kv == 0 else "")
+            cells.append(self.ramp_heat_bg(heat) + tcol
+                         + pad("L%02d%s%s" % (i, kvmark, mark), 5) + RST)
+        cw = 5
+        per_row = max(1, (width - 4) // cw)
+        body = []
+        for i in range(0, len(cells), per_row):
+            body.append("".join(cells[i:i + per_row]))
+        legend = ("  %s  %s working   %s  %s idle   %s★%s DSpark target   "
+                  "%s~%s KV-compressed   %s·%s full-KV"
+                  % (self.ramp_heat_bg(0.85), t.rst(),
+                     self.ramp_heat_bg(0.0), t.rst(),
+                     t.accent, t.rst(), t.label, t.rst(), t.label, t.rst()))
+        body.append(legend)
+        body.append(t.dim()
+                     + "  per-expert routing heat needs enable_return_routed_experts"
+                     + " (boot flag)" + t.rst())
+        if free and len(body) > free:
+            body = body[:free]
+        return body
+
+# ==================== suzu/render/frames.py
+"""Full-screen frame composition: full, perf, pipes, layers, spec views."""
+
+
+
+class FramesMixin:
     def frame(self, width, height=None):
         if self.mode == "layers":
             return self.frame_layers(width, height)
@@ -2979,6 +3456,8 @@ class View:
         if self.view == "perf":
             return self.frame_perf(width, height)
         return self.frame_spec(width, height)
+
+
 
     def frame_perf(self, width, height=None):
         """Performance zoom (p): the throughput story at full width - big
@@ -3055,6 +3534,8 @@ class View:
         self.last_frame = L
         return L
 
+
+
     def frame_pipes(self, width, height=None):
         """Memory-pipeline zoom (b): the hops a token takes on this box, as
         vertical VU meters. The repo's six strips assume split RAM/VRAM; on
@@ -3125,6 +3606,8 @@ class View:
         self.last_frame = L
         return L
 
+
+
     def pipe_verdict(self, cur, gpu_u, kv, r1):
         """The repo's bottleneck rule chain, adapted to this box: with the
         weights resident in unified memory there is no PCIe hop, so the
@@ -3144,39 +3627,7 @@ class View:
             return "no hop saturated - the gap is per-token latency"
         return "engine idle - nothing to bound"
 
-    def model_arch(self):
-        """Cached per-layer topology of the running engine (or None)."""
-        now = time.time()
-        if self.arch is None and now >= getattr(self, "arch_retry", 0.0):
-            self.arch_path = model_config_path()
-            if self.arch_path:
-                self.arch = load_model_arch(self.arch_path)
-            if self.arch is None:
-                self.arch_retry = now + 30.0
-        return self.arch
 
-    def _engine_aux(self):
-        """(vision_active, weights_offloaded, kv_usage) from one /metrics read."""
-        try:
-            txt = http_get("http://127.0.0.1:%d/metrics" % self.port,
-                           timeout=2, tries=1)
-            if not txt:
-                return False, False, None
-            mx = parse_metrics(txt)
-            q = g(mx, "vllm:mm_cache_queries_total")
-            now = time.time()
-            vact = False
-            if q is not None:
-                if self.mm_prev is not None and q > self.mm_prev \
-                        and now - self.mm_t < 120:
-                    vact = True
-                self.mm_prev, self.mm_t = q, now
-            woff = bool(gl(mx, "vllm:engine_sleep_state",
-                           'sleep_state="weights_offloaded"'))
-            kv = g(mx, "vllm:kv_cache_usage_perc")
-            return vact, woff, kv
-        except Exception:
-            return False, False, None
 
     def frame_layers(self, width, height=None):
         """Layer-activity panel: the model's REAL topology as a heat grid.
@@ -3335,61 +3786,7 @@ class View:
         self.last_frame = L
         return L
 
-    def layer_panel(self, width, free):
-        """Layer-activity visualizer: the model's REAL topology as coloured boxes.
 
-        Read-only - it reads /metrics and the engine's config.json and never
-        touches the engine, so it cannot perturb the LLM's output. Each layer is
-        a coloured box; the colour encodes work: hot = actively computing,
-        dim = idle, and the DSpark target layers are painted by their
-        speculative-decoding acceptance. This is the panel that sits where the
-        log is inside the spec view (toggled with L), not a separate screen.
-        """
-        t = self.t
-        res = self.step()
-        if res is None:
-            return []
-        cur, live = res
-        arch = self.model_arch()
-        if not arch:
-            return [t.dim() + "  no model config found - layer topology unavailable"
-                    + t.rst()]
-        n = arch["n"]
-        target = set(arch["target"])
-        comp = arch["compress"]
-        working = cur.busy and live["gen"] > 0
-        alpha = cur.acc / cur.draft if cur.draft > 0 else 0.0
-        # text colour that stays readable on a coloured box: dark on bright bg
-        tcol = "" if t.plain else fg(0)
-        cells = []
-        for i in range(n):
-            if i in target:
-                heat = alpha if working else 0.0
-                mark = t.accent + "★" + t.rst()
-            else:
-                heat = 0.85 if working else 0.0
-                mark = ""
-            kv = comp.get(i)
-            kvmark = ("~" if kv and kv > 1 else "·" if kv == 0 else "")
-            cells.append(self.ramp_heat_bg(heat) + tcol
-                         + pad("L%02d%s%s" % (i, kvmark, mark), 5) + RST)
-        cw = 5
-        per_row = max(1, (width - 4) // cw)
-        body = []
-        for i in range(0, len(cells), per_row):
-            body.append("".join(cells[i:i + per_row]))
-        legend = ("  %s  %s working   %s  %s idle   %s★%s DSpark target   "
-                  "%s~%s KV-compressed   %s·%s full-KV"
-                  % (self.ramp_heat_bg(0.85), t.rst(),
-                     self.ramp_heat_bg(0.0), t.rst(),
-                     t.accent, t.rst(), t.label, t.rst(), t.label, t.rst()))
-        body.append(legend)
-        body.append(t.dim()
-                     + "  per-expert routing heat needs enable_return_routed_experts"
-                     + " (boot flag)" + t.rst())
-        if free and len(body) > free:
-            body = body[:free]
-        return body
 
     def frame_spec(self, width, height=None):
         t = self.t
@@ -3505,17 +3902,7 @@ class View:
         A(dline)
         A("")
 
-        # ---- big decode readout (llm-visuals: tall numerals on the FLOW ramp).
-        # btop-style: full digits with room, stat line only on a short terminal.
-        dstat = (self.pulse_head(int(time.time() * 2)) + " DECODE"
-                 if cur.busy and gen > 0 else "  DECODE")
-        dstat_line = clip("%s%s%s %s%*.1f t/s%s  %s  %speak %*.1f%s  %s%s tok total%s"
-                          % (t.label, dstat, t.rst(),
-                             t.value + t.bold(), 6, gen, t.rst(),
-                             self.gauge(min(1.0, gen / max(self.pk_gen, 0.5))
-                                        if self.pk_gen else 0.0, 14),
-                             t.frame, 6, self.pk_gen, t.rst(),
-                             t.label, human(cur.gen), t.rst()), width)
+        # ---- big decode readout (llm-visuals: tall numerals on the FLOW ramp)
         if not height or height >= 26:
             if t.plain:
                 gcol = t.value if gen else t.frame
@@ -3525,10 +3912,15 @@ class View:
             for r in self.big_digits(gen, max(18, width // 2 - 4),
                                      gcol if not t.plain else ""):
                 A(clip(r, width))
-            A(dstat_line)
-            A("")
-        elif height >= 20:
-            A(dstat_line)
+            stat = (self.pulse_head(int(time.time() * 2)) + " DECODE"
+                    if cur.busy and gen > 0 else "  DECODE")
+            bar = self.gauge(min(1.0, gen / max(self.pk_gen, 0.5))
+                             if self.pk_gen else 0.0, 14)
+            A(clip("%s%s%s %s%*.1f t/s%s  %s  %speak %*.1f%s  %s%s tok total%s"
+                   % (t.label, stat, t.rst(),
+                      t.value + t.bold(), 6, gen, t.rst(),
+                      bar, t.frame, 6, self.pk_gen, t.rst(),
+                      t.label, human(cur.gen), t.rst()), width))
             A("")
 
         # ---- acceptance
@@ -3575,12 +3967,8 @@ class View:
             A(clip(line, width))
         A("")
 
-        # ---- engine/session, history, rolling averages. btop-style row budget:
-        # the engine box SHRINKS level by level (all-models block, then the
-        # per-request counters) instead of being clipped mid-border, history
-        # compacts to two rows, and a short terminal stacks instead of splitting
-        # columns. height=0/None keeps the old show-everything layout.
-        eng_core = [
+        # ---- engine/session, history, rolling averages
+        eng_body = [
             "%s%-13s%s %s" % (t.label, "kv cache", t.rst(), self.pct(sl["kv"], 10)),
             "%s%-13s%s %s%s" % (t.label, "prefix cache", t.rst(),
                                 self.pct(sl["prefix"], 10, good_high=True),
@@ -3601,12 +3989,9 @@ class View:
             *((lambda w: list(w) if isinstance(w, tuple) else [w])(self.waiting_row(cur))),
             "%s%-13s%s %s%s%s" % (t.label, "slot ctx", t.rst(), t.value,
                                   sl["ctxtxt"], t.rst()),
-        ]
-        eng_ctx = ["%s%-13s%s %s%s%s" % (t.label, "ctx max seen", t.rst(), t.label,
-                                         human(cur.ctxmax), t.rst())]
-        eng_tot = self.totals_rows(cur, hermes=False)
-        eng_herm = self.hermes_rows(self.sh_num)
-        eng_spec = [
+            "%s%-13s%s %s%s%s" % (t.label, "ctx max seen", t.rst(), t.label,
+                                  human(cur.ctxmax), t.rst()),
+            *self.totals_rows(cur),
             "",
             "%s%-13s%s %s%s%s" % (t.label, "accepted", t.rst(), t.value,
                                   human(cur.acc), t.rst()),
@@ -3619,52 +4004,14 @@ class View:
                                                      t.heat(s_alpha), s_alpha * 100,
                                                      t.rst(), t.frame, s_tau, t.rst())),
         ]
-        eng_l0 = eng_core + eng_ctx + eng_tot + eng_herm + eng_spec
-        eng_l1 = eng_core + eng_ctx + eng_tot + eng_spec
-        eng_l2 = eng_core + eng_tot
-        eng_l3 = [eng_core[0], eng_core[1], eng_core[3]] + eng_tot[-1:]
-        wide = width >= self.WIDE and (not height or height >= 40)
-        lw = max(34, int(width * 0.36)) if wide else width
-        rw = (width - lw - 2) if wide else width
-        sw = max(4, rw - 36)
-        heat_body = self.heatmap_rows(rw) if rw >= 44 else None
-        heat_cost = (len(heat_body) + 2) if heat_body else 0
-        dig_rows = 8 if (not height or height >= 26) else (2 if height >= 20 else 0)
-        base_rows = ((3 + (1 if strip else 0)) + 3
-                     + (4 if width >= self.NARROW else 10) + dig_rows)
-        hist_all = [
-            self.hrow("gen t/s", self.h_gen, sw, "%.1f", t.heat(0.9),
-                      "%d tick" % len(self.h_gen), fit=rw - 2),
-            self.hrow("prompt t/s", self.h_pf, sw, "%.0f", t.heat(0.7), "", fit=rw - 2),
-            self.hrow("accept %", self.h_acc, sw, "%.0f", t.heat(alpha),
-                      "n/a on tensorfold" if cur.tf_nodraft else "%d req" % len(self.h_acc), fit=rw - 2),
-            self.hrow("tau", self.h_tau, sw, "%.2f", t.head, "", fit=rw - 2),
-        ]
-        # ---- layout search: engine level x history compact x rolling x heatmap.
-        # Value = engine detail first, then the tokens heatmap, then rolling;
-        # a layout is legal when everything above + the block leaves >= 3 rows
-        # (per-position and the panels below gate themselves on real space).
-        best = None
-        for ei, body in enumerate((eng_l0, eng_l1, eng_l2, eng_l3)):
-            ecost = len(body) + 2
-            for compact in (False, True):
-                hbody = hist_all[:2] if compact else hist_all
-                hcost = len(hbody) + 2
-                for roll in (True, False):
-                    for heat in ((True, False) if heat_body else (False,)):
-                        right = hcost + (4 if roll else 0) + (heat_cost if heat else 0)
-                        block = max(ecost, right) if wide else ecost + right
-                        if not height or height - base_rows - block >= 3:
-                            val = ((3 - ei) * 100 + (50 if heat else 0)
-                                   + (10 if roll else 0) - (5 if compact else 0))
-                            if best is None or val > best[0]:
-                                best = (val, body, hbody, roll, heat)
-        if best:
-            _, eng_body, hist_body, roll_ok, heat_ok = best
-            eng_cost = len(eng_body) + 2
-        else:  # terminal far too small even for the minimum: show the core anyway
-            eng_body, eng_cost = eng_l3, len(eng_l3) + 2
-            hist_body, roll_ok, heat_ok = hist_all[:2], False, False
+        # ---- content-aware grid (19-10: "right sized ... doesn't resize at all").
+        # Each column asks for the width its own text needs; three columns only
+        # when they can hold their content, otherwise two, otherwise stacked.
+        # Slack is shared instead of the fixed 38/32 fractions that squeezed the
+        # left box to 47 columns for an 89-column line and clipped it mid-word.
+        def _need(body, floor=24):
+            return max(floor, max([vis_len(x) for x in body] + [0]) + 4)
+
         avg_body = [
             "%s%-15s%s %s%.1f%s   %s%-11s%s %s%s%s"
             % (t.label, "avg gen t/s", t.rst(), t.value, self.wmean(self.q_gen),
@@ -3675,28 +4022,76 @@ class View:
                t.rst(), t.label, "avg tau", t.rst(), t.value,
                self.wmean(self.q_tau), t.rst()),
         ]
-        left = self.box("engine & session", eng_body, lw)
-        right_col = self.box("history", hist_body, rw)
-        if roll_ok:
-            right_col += self.box("rolling averages", avg_body, rw)
-        if heat_ok and heat_body:
-            right_col += self.box("generated tokens per day . all models", heat_body, rw)
-        if wide:
-            for i in range(max(len(left), len(right_col))):
-                a = left[i] if i < len(left) else ""
-                b = right_col[i] if i < len(right_col) else ""
-                A(clip(pad(a, lw) + "  " + b, width))
+        # The cluster panel narrows itself below 110 columns, so measure the
+        # narrow shape it will actually render in a side column.
+        cl_probe = self.cluster_panel(min(78, max(34, width - 4)))
+        need_l = _need(eng_body, 34)
+        if cl_probe:
+            need_l = max(need_l, _need(cl_probe, 34))
+        need_m, need_r = 34, 44
+        if need_l + need_m + need_r + 4 <= width:
+            ncols = 3
+        elif need_l + need_r + 2 <= width:
+            ncols = 2
         else:
-            for r in left + right_col:
-                A(clip(r, width))
-        A("")
-
-        # ---- per-position: wraps onto as many rows as the width needs
-        # (btp-style budget: dropped entirely when too few rows remain)
-        if posn and (not height or height - len(L) >= 4):
-            barw = 8 if width >= 100 else 5 if width >= 60 else 3
+            ncols = 1
+        if ncols == 3:
+            rest = width - 4 - need_l
+            extra = max(0, rest - need_m - need_r)
+            tot = need_l + need_m + need_r
+            lw = need_l + extra * need_l // tot
+            mw = need_m + extra * need_m // tot
+            rw = width - 4 - lw - mw
+        elif ncols == 2:
+            lw = min(need_l, width - 2 - need_r)
+            rw = width - 2 - lw
+            mw = rw if rw >= 44 else width
+        else:
+            lw = mw = rw = width
+        wide = ncols >= 2
+        sw = max(4, rw - 36)
+        hist_body = [
+            self.hrow("gen t/s", self.h_gen, sw, "%.1f", t.heat(0.9),
+                      "%d tick" % len(self.h_gen), fit=rw - 2),
+            self.hrow("prompt t/s", self.h_pf, sw, "%.0f", t.heat(0.7), "", fit=rw - 2),
+            self.hrow("accept %", self.h_acc, sw, "%.0f", t.heat(alpha),
+                      "n/a on tensorfold" if cur.tf_nodraft else "%d req" % len(self.h_acc),
+                      fit=rw - 2),
+            self.hrow("tau", self.h_tau, sw, "%.2f", t.head, "", fit=rw - 2),
+        ]
+        cl = self.cluster_panel(lw)
+        # Height guard (left column): GB10 must ALWAYS sit under engine & session,
+        # even on a short terminal where the full engine & session box would push GB10
+        # past the L[:height] trim. If eng_body + GB10 won't fit the available rows,
+        # drop engine & session rows from the bottom (least-important first: session,
+        # drafted, accepted, the trailing blank, ctx max seen, slot ctx, then totals)
+        # until it fits. GB10 itself is never trimmed.
+        if cl and height:
+            avail = height - len(L)
+            need = (len(eng_body) + 2) + 1 + (len(cl) + 2)
+            while need > avail and len(eng_body) > 5:
+                eng_body.pop()
+                need -= 1
+        left_col = self.box("engine & session", eng_body, lw)
+        if cl:
+            left_col.append("")
+            left_col += self.box(self.cluster_title(), cl, lw, t.accent)
+        # Middle column = per-day chart only. History moved down to the right column
+        # to stack with rolling averages and per-position. In two-column mode the
+        # heatmap joins the right column (it needs ~44 columns, not a whole row).
+        heat_body = self.heatmap_rows(mw)
+        heat_title = ("generated tokens per day . all models" if mw >= 42
+                      else "generated tokens per day" if mw >= 28 else "tokens/day")
+        heat_box = (self.box(heat_title, heat_body, mw)
+                    if heat_body else [])
+        mid_col = heat_box if ncols == 3 else []
+        # per-position acceptance: a small box that wraps one row of cells per the
+        # column width it is rendered in. In wide mode it lives in the RIGHT column,
+        # under rolling averages; in narrow mode it stays full-width at the bottom.
+        def _pos_box(w):
+            barw = 8 if w >= 100 else 5 if w >= 60 else 3
             cellw = barw + 10
-            per = max(1, (width - 4) // cellw)
+            per = max(1, (w - 4) // cellw)
             chunks = []
             for i in range(len(posn)):
                 v = (posn[i] / posd) if posd else 0.0
@@ -3706,18 +4101,55 @@ class View:
             body = []
             for i in range(0, len(chunks), per):
                 body.append("".join(pad(c, cellw) for c in chunks[i:i + per]))
-            for r in self.box("per-position acceptance  (%s)" % src, body, width, t.accent):
+            return self.box("per-position acceptance  (%s)" % src, body, w, t.accent)
+        # RIGHT column: rolling averages + per-position are the must-keep boxes
+        # (per the user's layout request); history is shown on top only when there
+        # is room in the grid, so on a short wide terminal we drop history (the
+        # least-priority of the three) rather than rolling or per-position.
+        hist_box = self.box("history", hist_body, rw) if hist_body else []
+        avg_box = self.box("rolling averages", avg_body, rw)
+        pos_box = _pos_box(rw) if (posn and wide) else []
+        right_col = list(avg_box)
+        if pos_box:
+            right_col.append("")
+            right_col += pos_box
+        if wide and hist_box:
+            if not (height and (height - len(L)) < len(right_col) + len(hist_box) + 1):
+                right_col = list(hist_box) + [""] + right_col
+        if ncols == 2 and heat_box and mw != width:
+            # the heatmap is the first thing to go when the block would run past
+            # the terminal: it is a day chart, not a live gauge
+            if not height or (height - len(L)) >= max(len(left_col), len(right_col)) + len(heat_box) + 1:
+                right_col.append("")
+                right_col += heat_box
+        if ncols == 3:
+            for i in range(max(len(left_col), len(mid_col), len(right_col))):
+                a = left_col[i] if i < len(left_col) else ""
+                b = mid_col[i] if i < len(mid_col) else ""
+                c = right_col[i] if i < len(right_col) else ""
+                A(clip(pad(a, lw) + "  " + pad(b, mw) + "  " + c, width))
+        elif ncols == 2:
+            for i in range(max(len(left_col), len(right_col))):
+                a = left_col[i] if i < len(left_col) else ""
+                c = right_col[i] if i < len(right_col) else ""
+                A(clip(pad(a, lw) + "  " + c, width))
+            if heat_box and mw == width:
+                for r in heat_box:
+                    A(clip(r, width))
+        else:
+            for r in left_col:
                 A(clip(r, width))
+            if heat_box:
+                for r in heat_box:
+                    A(clip(r, width))
+            for r in right_col:
+                A(clip(r, width))
+        A("")
 
-        # ---- the two boxes (GPU, memory, the TP link) + gateway lanes. 05-10: the node box replaced
-        # "gpu . memory . gb10" (it shows this box's GPU and RAM too). Priority on a short terminal: nodes, then
-        # lanes, then the expert map below, which takes the rows that are left.
+        # ---- gateway lanes. (The GB10 / cluster node box now lives directly under the
+        # engine & session panel; see that section. It shows this box's GPU + RAM and the
+        # rank-1 worker + RoCE link on a TP pair, and is the highest-priority box.)
         free_rows = (height - len(L)) if height else 99
-        cl = self.cluster_panel(width) if free_rows >= 5 else None
-        if cl:
-            for r in self.box(self.cluster_title(), cl, width, t.accent):
-                A(clip(r, width))
-            free_rows -= len(cl) + 2
         ln = self.lanes_panel(cur, width) if free_rows >= 3 else None
         if ln:
             for r in self.box("gateway lanes", ln, width, t.head):
@@ -3775,20 +4207,134 @@ class View:
         self.last_frame = L
         return L
 
-    @staticmethod
-    def mean(seq):
-        return sum(seq) / len(seq) if seq else 0.0
+# ==================== suzu/render/view.py
+"""The dashboard object.
 
-    @staticmethod
-    def wmean(seq):
-        """sum(numerators)/sum(denominators) over the window - the rate itself,
-        not the mean of the per-tick rates."""
-        num = sum(a for a, _ in seq)
-        den = sum(b for _, b in seq)
-        return num / den if den else 0.0
+`View` is assembled from four mixins so each concern has its own file:
+
+  core.py     state: construction, theme cycling, ramps, smoothing, tick()
+  widgets.py  drawing primitives: bars, sparks, boxes, gauges, big digits
+  panels.py   panel builders: cluster, lanes, model strip, experts, heatmap
+  frames.py   full-screen composition: full / perf / pipes / layers / spec
+
+Methods in one mixin call methods from another through `self`, exactly as they
+did inside the single class.
+"""
 
 
-# ------------------------------------------------------------------ main ---
+class View(WidgetsMixin, PanelsMixin, FramesMixin, CoreMixin):
+    """Live view of one engine on one port.
+
+    Nothing is cached per terminal size: every frame is rebuilt from the size
+    it is given, so a resize takes effect on the next tick.
+    """
+
+# ==================== suzu/cli.py
+"""suzu - a small bell for your LLM engine: live monitor for a
+speculative-decoding inference server.
+
+This is the public single-file release of an internal tool.
+
+The full-screen speculative-decoding panel idea comes from a dashboard posted
+in the NVIDIA DGX Spark forum thread; the 2026-09 rework borrowed visual ideas
+from DingoOz/llm-visuals (MIT): half-block big digits, VU gauges with
+peak-hold, attack/release fade, the expert heat map, theme-aware RGB ramps,
+and the views (`p` performance, `b` token pipeline).
+
+*** The measurement that dictates this codebase's whole architecture ***
+llama.cpp's /metrics counters DO NOT MOVE during a generation. They are
+flushed at request completion. Measured: 6.2 s of active slot produced delta
+0 on tokens_predicted_total and on every spec_decode_* counter, while the
+model was emitting 20.5 tok/s. A 1 s monitor built on /metrics alone would
+read "0 tok/s" for minutes under full load. Hence the split:
+
+  live rate       <- /slots  next_token.n_decoded   (advances every token)
+  prefill         <- /slots  n_prompt_tokens_processed
+  KV/prefix cache <- /slots  (llama.cpp exposes NEITHER on /metrics)
+  acceptance, tau, p0..pN <- /metrics, shown WITH THE AGE of the last closed
+                             request rather than passed off as instantaneous
+
+Sources, all already exposed - no engine patch required:
+  /slots    next_token.n_decoded, n_prompt_tokens{,_processed,_cache}, n_ctx,
+            is_processing
+  /metrics  spec_decode_num_{draft,accepted}_tokens_total,
+            ..._num_drafts_total, ..._accepted_tokens_per_pos_total{position=N}
+  ps -ww    server cmdline -> draft model, spec method, k, uptime, plus what
+            vLLM adds: quantisation, kv dtype, tensor-parallel size, nnodes,
+            max-num-seqs, max model len (the model strip reads these)
+  nvidia-smi  GPU utilisation, VRAM, watts, degC, SM clock (the GB10 panel)
+  --lanes-url  optional gateway lanes endpoint: the queue you actually sit
+            in, which /metrics cannot see (the gateway answers before
+            touching the scheduler, so polling it is free)
+  --rank1-url  rank 1 of a tensor-parallel pair (Prometheus textformat),
+            probed only when the cmdline says --nnodes 2: the cluster is
+            only as alive as its quietest rank
+
+*** 29-08: TabbyAPI/exllamav3 (entry glm53x, the daily driver at the time)
+exposes NONE of this - /metrics and /slots answer 404. The `tabby` adapter
+(fetch/tabby.py, synth_tabby) rebuilds the same keys from /props + the
+gateway stats + the `Metrics (ID: ...)` line in the engine log, so the rest
+of the code does not change. Live tokens come from the gateway, the only
+component that sees them pass.
+
+*** 30-09: TensorFold (entry glm53tf, the main engine since) has /metrics
+but in its own words (tensorfold_*), flushed at request close like
+llama.cpp, and no /slots. fetch/tensorfold.py (synth_tensorfold) maps it onto
+the same keys: closed counters from /metrics, the in-flight part from the
+gateway's SSE events (one event per verify round) times tokens/round, the
+last request's prompt/cached from its request log. It counts no drafted
+tokens, so the panel shows tokens/round instead of an acceptance percentage.
+The same request log gives the all-time totals (`since DD-MM` row), which
+survive engine restarts; the /metrics ones start again at every boot.
+
+Views:  full (default) . p = performance zoom . b = token pipeline (vertical
+VU meters + bottleneck verdict, the repo's bandwidth view adapted to GB10
+unified memory: no PCIe hop, but the gateway lanes and the rank-1 link are
+ours) . g = full-screen layer grid.
+
+usage: suzu.py [interval] [--port N] [--theme NAME] [--color auto|truecolor|256]
+               [--tokens-db PATH] [--rank1-url URL] [--lanes-url URL]
+               [--no-log] [--once] [--list-themes] [--layers]
+keys:  t = cycle theme   l = toggle log   L = layer grid   g = full-screen layer grid
+       p = performance zoom   b = token pipeline   q = quit
+
+The code lives in this package (see ARCHITECTURE.md); this module is the
+command line front end and the redraw loop.
+"""
+
+
+try:
+    import termios
+    import tty
+    HAVE_TTY = True
+except ImportError:                     # not a POSIX terminal - keys disabled
+    HAVE_TTY = False
+
+
+def term_size(fallback=(100, 40)):
+    """Real terminal size, from the tty.
+
+    COLUMNS/LINES in the environment are a snapshot taken by the shell that
+    launched us and never change afterwards: a fish (or a bash that exported
+    them) hands suzu the size the pane had at launch, so a resize would keep
+    drawing the old layout forever. The kernel's winsize is the only live
+    source; the env is a last resort for when stdout/stdin are pipes.
+    """
+    for fd in (1, 0, 2):
+        try:
+            s = os.get_terminal_size(fd)
+            if s.columns > 0 and s.lines > 0:
+                return s
+        except (OSError, ValueError, AttributeError):
+            pass
+    try:
+        cols = int(os.environ.get("COLUMNS", ""))
+        lines = int(os.environ.get("LINES", ""))
+    except ValueError:
+        cols = lines = 0
+    return os.terminal_size((cols or fallback[0], lines or fallback[1]))
+
+
 def main():
     port, interval, show_log, once = 30001, 1.0, True, False
     layers = False
@@ -3857,13 +4403,12 @@ def main():
         except ValueError:
             pass
 
-    global HERMES_DB, LANES_URL, RANK1_URL, _RANK1
     if tokens_db:
-        HERMES_DB = os.path.expanduser(tokens_db)
-    LANES_URL = lanes_url or None
-    RANK1_URL = rank1_url or None
-    if RANK1_URL:
-        _RANK1 = _rank1_feed(RANK1_URL)   # rebuild the process-wide feed with the URL
+        config.HERMES_DB = os.path.expanduser(tokens_db)
+    config.LANES_URL = lanes_url or None
+    config.RANK1_URL = rank1_url or None
+    if config.RANK1_URL:
+        globals()["_RANK1"] = _rank1_feed(config.RANK1_URL)   # rebuild the process-wide feed with the URL
 
     view = View(port, interval, show_log, theme)
     if layers:
@@ -3871,7 +4416,7 @@ def main():
     out = sys.stdout
 
     if once:
-        size = shutil.get_terminal_size((100, 40))
+        size = term_size()
         w, h = min(size.columns, 500), size.lines
         # One sample has no delta - every rate would read 0 and look like a fault.
         # Take two; the first is only the baseline.
@@ -3911,7 +4456,7 @@ def main():
     lastsize = None
     try:
         while True:
-            size = shutil.get_terminal_size((100, 40))
+            size = term_size()
             w, h = min(size.columns, 500), size.lines
             if resized["flag"] or lastsize != (w, h):
                 # A shrink leaves stale glyphs to the right and below. Full erase
@@ -3969,5 +4514,6 @@ def main():
         bye()
 
 
+# ==================== entry point
 if __name__ == "__main__":
     sys.exit(main())
