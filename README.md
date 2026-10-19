@@ -163,6 +163,7 @@ release file:
 ```bash
 python3 tools/bundle.py     # rebuild suzu.py
 python3 test_suzu.py        # offline suite, exit 0 = all good
+python3 tools/shots.py /tmp/shots   # re-capture the README assets (tmux + PIL)
 ```
 
 `ARCHITECTURE.md` has the module map, one tick's data flow, the laws the tests
