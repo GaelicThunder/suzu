@@ -105,12 +105,14 @@ def pad(s, w):
 
 
 def clip(s, w):
-    """Truncate by VISIBLE characters - len() lies on coloured strings."""
+    """Truncate by VISIBLE characters - len() lies on coloured strings. When the
+    cut would land inside a word it backs up to the last space that fits and
+    drops the separator: a row that has to go loses its tail, not half a word."""
     if w <= 0:
         return ""
     if vis_len(s) <= w:
         return s
-    out, seen, i, had = [], 0, 0, False
+    out, seen, i, had, last = [], 0, 0, False, None
     while i < len(s) and seen < w:
         if s[i] == "\033":
             j = s.find("m", i)
@@ -121,12 +123,16 @@ def clip(s, w):
             i = j + 1
             continue
         out.append(s[i])
+        if s[i] == " ":
+            last = (len(out), seen)
         seen += 1
         i += 1
+    if last is not None and last[1] >= max(6, w // 2):
+        out = out[:last[0]]
     # A cut can land inside a coloured run, so close it - but only when the
     # string had any escape at all: appending RST unconditionally painted a
     # reset into plain (mono) output and broke the "no ANSI in mono" contract.
-    return "".join(out) + (RST if had else "")
+    return "".join(out).rstrip(" .") + (RST if had else "")
 
 
 
@@ -4585,6 +4591,10 @@ def main():
     if once:
         size = term_size()
         w, h = min(size.columns, 500), size.lines
+        if os.environ.get("HERDR_ENV"):
+            # herdr replaces the last cell of a row that spans the width exactly
+            # with a wrap glyph, hiding the box border: leave that column empty.
+            w = max(20, w - 1)
         # One sample has no delta - every rate would read 0 and look like a fault.
         # Take two; the first is only the baseline.
         view.frame(w, h)
@@ -4625,6 +4635,9 @@ def main():
         while True:
             size = term_size()
             w, h = min(size.columns, 500), size.lines
+            if os.environ.get("HERDR_ENV"):
+                # Same wrap-glyph cell as above: leave the last column empty.
+                w = max(20, w - 1)
             if resized["flag"] or lastsize != (w, h):
                 # A shrink leaves stale glyphs to the right and below. Full erase
                 # on the resize frame only - doing it every frame flickers.

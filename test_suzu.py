@@ -176,15 +176,22 @@ _real_clip = _text.clip
 
 
 def _count_clip(s, w):
+    r = _real_clip(s, w)
     if m.vis_len(s) > w:
-        _cuts.append((m.vis_len(s), w, m.SGR_RE.sub("", s)[:52]))
-    return _real_clip(s, w)
+        # A cut is a violation only when it lands INSIDE a word: clip() backs up
+        # to the last space, so the char after the returned text is a space.
+        ps = m.SGR_RE.sub("", s)
+        pr = m.SGR_RE.sub("", r)
+        nxt = ps[len(pr)] if len(pr) < len(ps) else ""
+        if nxt and nxt.isalnum() and pr and (pr[-1].isalnum() or pr[-1] in "-_/"):
+            _cuts.append((m.vis_len(s), w, ps[:52], pr[-18:]))
+    return r
 
 
 _clip_mods = (m, _text, _widgets, suzu.render.frames, suzu.render.panels)
 for _mod in _clip_mods:
     setattr(_mod, "clip", _count_clip)
-for w in (74, 84, 100, 118, 130, 160, 200):
+for w in (40, 48, 60, 74, 84, 100, 118, 130, 160, 200):
     for h in (24, 40, 62):
         _cuts.clear()
         v.frame(w, h)

@@ -25,12 +25,14 @@ def pad(s, w):
 
 
 def clip(s, w):
-    """Truncate by VISIBLE characters - len() lies on coloured strings."""
+    """Truncate by VISIBLE characters - len() lies on coloured strings. When the
+    cut would land inside a word it backs up to the last space that fits and
+    drops the separator: a row that has to go loses its tail, not half a word."""
     if w <= 0:
         return ""
     if vis_len(s) <= w:
         return s
-    out, seen, i, had = [], 0, 0, False
+    out, seen, i, had, last = [], 0, 0, False, None
     while i < len(s) and seen < w:
         if s[i] == "\033":
             j = s.find("m", i)
@@ -41,12 +43,16 @@ def clip(s, w):
             i = j + 1
             continue
         out.append(s[i])
+        if s[i] == " ":
+            last = (len(out), seen)
         seen += 1
         i += 1
+    if last is not None and last[1] >= max(6, w // 2):
+        out = out[:last[0]]
     # A cut can land inside a coloured run, so close it - but only when the
     # string had any escape at all: appending RST unconditionally painted a
     # reset into plain (mono) output and broke the "no ANSI in mono" contract.
-    return "".join(out) + (RST if had else "")
+    return "".join(out).rstrip(" .") + (RST if had else "")
 
 
 

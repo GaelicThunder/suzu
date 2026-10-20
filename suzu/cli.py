@@ -269,6 +269,10 @@ def main():
     if once:
         size = term_size()
         w, h = min(size.columns, 500), size.lines
+        if os.environ.get("HERDR_ENV"):
+            # herdr replaces the last cell of a row that spans the width exactly
+            # with a wrap glyph, hiding the box border: leave that column empty.
+            w = max(20, w - 1)
         # One sample has no delta - every rate would read 0 and look like a fault.
         # Take two; the first is only the baseline.
         view.frame(w, h)
@@ -309,6 +313,9 @@ def main():
         while True:
             size = term_size()
             w, h = min(size.columns, 500), size.lines
+            if os.environ.get("HERDR_ENV"):
+                # Same wrap-glyph cell as above: leave the last column empty.
+                w = max(20, w - 1)
             if resized["flag"] or lastsize != (w, h):
                 # A shrink leaves stale glyphs to the right and below. Full erase
                 # on the resize frame only - doing it every frame flickers.
